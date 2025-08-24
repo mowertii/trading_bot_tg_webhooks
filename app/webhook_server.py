@@ -8,8 +8,6 @@ import os
 import json
 from decimal import Decimal
 from typing import Dict, Any
-import hashlib
-import hmac
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,12 +17,12 @@ class WebhookServer:
         self.tinkoff_token = os.getenv("TINKOFF_TOKEN")
         self.account_id = os.getenv("ACCOUNT_ID")
         self.bot_token = os.getenv("BOT_TOKEN")
-        self.target_user_id = os.getenv("TARGET_USER_ID")
+        self.chat_id = os.getenv("TG_CHAT_ID")
         self.webhook_secret = os.getenv("WEBHOOK_SECRET", "default_secret_change_me")
         
         self.client = TinkoffClient(self.tinkoff_token, self.account_id)
         self.executor = OrderExecutor(self.tinkoff_token, self.account_id)
-        self.session = None
+        self.session: ClientSession | None = None
     
     async def start_session(self):
         self.session = ClientSession()
@@ -33,21 +31,11 @@ class WebhookServer:
         if self.session:
             await self.session.close()
     
-    def verify_signature(self, payload: bytes, signature: str) -> bool:
-        if not signature:
-            return False
-        expected_signature = hmac.new(
-            self.webhook_secret.encode(),
-            payload,
-            hashlib.sha256
-        ).hexdigest()
-        return hmac.compare_digest(f"sha256={expected_signature}", signature)
-    
     async def send_telegram_message(self, text: str):
-        if not self.session or not self.target_user_id:
+        if not self.session or not self.chat_id:
             return
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        data = {"chat_id": self.target_user_id, "text": text}
+        data = {"chat_id": self.chat_id, "text": text}
         try:
             async with self.session.post(url, json=data) as resp:
                 if resp.status != 200:
@@ -60,18 +48,15 @@ class WebhookServer:
             if request.content_type != 'application/json':
                 return web.Response(status=400, text="Content-Type must be application/json")
             
-            payload = await request.read()
-            signature = request.headers.get('X-Signature-256')
-            if signature and not self.verify_signature(payload, signature):
-                logger.warning("Invalid webhook signature")
-                return web.Response(status=401, text="Invalid signature")
+            payload = await request.json()
             
-            try:
-                data = json.loads(payload.decode('utf-8'))
-            except json.JSONDecodeError:
-                return web.Response(status=400, text="Invalid JSON")
+            # Проверка секрета в теле запроса
+            secret = payload.get("secret")
+            if secret != self.webhook_secret:
+                logger.warning("Invalid webhook secret")
+                return web.Response(status=401, text="Invalid secret")
             
-            result = await self.process_trading_signal(data)
+            result = await self.process_trading_signal(payload)
             return web.json_response({"status": "success", "result": result})
             
         except Exception as e:
@@ -80,18 +65,16 @@ class WebhookServer:
             return web.Response(status=500, text="Internal server error")
     
     async def process_trading_signal(self, data: Dict[str, Any]) -> str:
-        # Корректная валидация обязательных полей
         if 'action' not in data:
             raise ValueError("Missing required field: action")
         action = data['action'].lower()
 
-        # Для buy/sell нужен symbol, для close_all и balance — нет
         if action in ('buy', 'sell'):
             if 'symbol' not in data:
                 raise ValueError("Missing required field: symbol")
             symbol = data['symbol'].upper()
         else:
-            symbol = data.get('symbol', None)
+            symbol = data.get('symbol')
 
         logger.info(f"Processing trading signal: {action} {symbol or ''}".strip())
         
@@ -143,10 +126,11 @@ class WebhookServer:
         closed_count = 0
         for pos in positions:
             try:
+                opposite_direction = 'short' if pos.direction == 'long' else 'long'
                 await self.executor.execute_smart_order(
                     figi=pos.figi,
-                    desired_direction=pos.direction,
-                    amount=0,
+                    desired_direction=opposite_direction,
+                    amount=Decimal(pos.lots),
                     close_only=True
                 )
                 closed_count += 1
@@ -177,14 +161,13 @@ def create_app():
     @web.middleware
     async def logging_middleware(request, handler):
         start_time = asyncio.get_event_loop().time()
+        response = None
         try:
             response = await handler(request)
             return response
         finally:
             process_time = asyncio.get_event_loop().time() - start_time
-            # request — это именно объект Request, у него есть method и path
-            # response может быть не создан при исключении, поэтому защитимся
-            status = getattr(locals().get('response', None), 'status', 500)
+            status = getattr(response, 'status', 500)
             logger.info(f"{request.method} {request.path} - {status} - {process_time:.3f}s")
 
     app.middlewares.append(logging_middleware)
