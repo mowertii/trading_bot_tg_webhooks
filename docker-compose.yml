@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  # 🆕 Webhook сервер (основной сервис)
+  webhook-bot:
+    build: 
+      context: ./app
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    env_file: .env
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - TARGET_USER_ID=${TARGET_USER_ID}
+      - TINKOFF_TOKEN=${TINKOFF_TOKEN}
+      - ACCOUNT_ID=${ACCOUNT_ID}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - WEBHOOK_REQUIRE_SIGNATURE=false # если секрет в теле, и заголовок не нужен
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - db
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # 🔧 Старый Telegram polling бот (опционально, для экстренных случаев)
+  telegram-bot:
+    build: 
+      context: ./app
+      dockerfile: Dockerfile
+    command: python -m bot.main
+    env_file: .env
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - TARGET_USER_ID=${TARGET_USER_ID}
+      - TINKOFF_TOKEN=${TINKOFF_TOKEN}
+      - ACCOUNT_ID=${ACCOUNT_ID}
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - db
+#    profiles: ["emergency"]  # Запускается только при --profile emergency
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  db:
+    image: postgres:13
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  postgres_data:
