@@ -8,6 +8,8 @@ import os
 import json
 from decimal import Decimal
 from typing import Dict, Any
+import hashlib
+import hmac
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,6 +33,17 @@ class WebhookServer:
         if self.session:
             await self.session.close()
     
+    def verify_signature(self, payload: bytes, signature: str) -> bool:
+        """Проверка HMAC подписи в заголовке"""
+        if not signature:
+            return False
+        expected_signature = hmac.new(
+            self.webhook_secret.encode(),
+            payload,
+            hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(f"sha256={expected_signature}", signature)
+    
     async def send_telegram_message(self, text: str):
         if not self.session or not self.chat_id:
             return
@@ -48,15 +61,31 @@ class WebhookServer:
             if request.content_type != 'application/json':
                 return web.Response(status=400, text="Content-Type must be application/json")
             
-            payload = await request.json()
+            payload = await request.read()
+
+            # --- Проверка безопасности ---
+            signature = request.headers.get("X-Signature-256")
+            token = request.query.get("token")
+
+            if signature:
+                if not self.verify_signature(payload, signature):
+                    logger.warning("Invalid HMAC signature")
+                    return web.Response(status=401, text="Invalid signature")
+            elif token:
+                if token != self.webhook_secret:
+                    logger.warning("Invalid query token")
+                    return web.Response(status=401, text="Invalid token")
+            else:
+                logger.warning("No authentication provided")
+                return web.Response(status=401, text="Missing authentication")
+            # ------------------------------
+
+            try:
+                data = json.loads(payload.decode("utf-8"))
+            except json.JSONDecodeError:
+                return web.Response(status=400, text="Invalid JSON")
             
-            # Проверка секрета в теле запроса
-            secret = payload.get("secret")
-            if secret != self.webhook_secret:
-                logger.warning("Invalid webhook secret")
-                return web.Response(status=401, text="Invalid secret")
-            
-            result = await self.process_trading_signal(payload)
+            result = await self.process_trading_signal(data)
             return web.json_response({"status": "success", "result": result})
             
         except Exception as e:
@@ -65,24 +94,24 @@ class WebhookServer:
             return web.Response(status=500, text="Internal server error")
     
     async def process_trading_signal(self, data: Dict[str, Any]) -> str:
-        if 'action' not in data:
+        if "action" not in data:
             raise ValueError("Missing required field: action")
-        action = data['action'].lower()
+        action = data["action"].lower()
 
-        if action in ('buy', 'sell'):
-            if 'symbol' not in data:
+        if action in ("buy", "sell"):
+            if "symbol" not in data:
                 raise ValueError("Missing required field: symbol")
-            symbol = data['symbol'].upper()
+            symbol = data["symbol"].upper()
         else:
-            symbol = data.get('symbol')
+            symbol = data.get("symbol")
 
         logger.info(f"Processing trading signal: {action} {symbol or ''}".strip())
         
-        if action == 'close_all':
+        if action == "close_all":
             return await self.handle_close_all_signal()
-        elif action in ('buy', 'sell'):
+        elif action in ("buy", "sell"):
             return await self.handle_trade_signal(action, symbol, data)
-        elif action == 'balance':
+        elif action == "balance":
             return await self.handle_balance_signal()
         else:
             raise ValueError(f"Unknown action: {action}")
@@ -93,8 +122,8 @@ class WebhookServer:
             raise ValueError(f"Инструмент {symbol} не найден")
         
         positions = await self.client.get_positions_async()
-        direction = 'long' if action == 'buy' else 'short'
-        risk_percent = Decimal(str(data.get('risk_percent', 0.4 if action == 'buy' else 0.3)))
+        direction = "long" if action == "buy" else "short"
+        risk_percent = Decimal(str(data.get("risk_percent", 0.4 if action == "buy" else 0.3)))
         
         opposite_pos = next((p for p in positions if p.ticker == symbol and p.direction != direction), None)
         if opposite_pos:
@@ -126,7 +155,7 @@ class WebhookServer:
         closed_count = 0
         for pos in positions:
             try:
-                opposite_direction = 'short' if pos.direction == 'long' else 'long'
+                opposite_direction = "short" if pos.direction == "long" else "long"
                 await self.executor.execute_smart_order(
                     figi=pos.figi,
                     desired_direction=opposite_direction,
@@ -167,27 +196,27 @@ def create_app():
             return response
         finally:
             process_time = asyncio.get_event_loop().time() - start_time
-            status = getattr(response, 'status', 500)
+            status = getattr(response, "status", 500)
             logger.info(f"{request.method} {request.path} - {status} - {process_time:.3f}s")
 
     app.middlewares.append(logging_middleware)
 
-    app.router.add_post('/webhook', webhook_server.handle_webhook)
-    app.router.add_get('/health', webhook_server.handle_health_check)
+    app.router.add_post("/webhook", webhook_server.handle_webhook)
+    app.router.add_get("/health", webhook_server.handle_health_check)
 
-    app['webhook_server'] = webhook_server
+    app["webhook_server"] = webhook_server
     return app
 
 async def init_app():
     app = create_app()
-    webhook_server = app['webhook_server']
+    webhook_server = app["webhook_server"]
     await webhook_server.start_session()
     return app
 
 async def cleanup_app(app):
-    webhook_server = app['webhook_server']
+    webhook_server = app["webhook_server"]
     await webhook_server.close_session()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app = create_app()
-    web.run_app(app, host='0.0.0.0', port=8080)
+    web.run_app(app, host="0.0.0.0", port=8080)
