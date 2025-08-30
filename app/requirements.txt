@@ -1,4 +1,4 @@
-python-telegram-bot>=20.0
+python-telegram-bot>=20.*
 tinkoff-investments
 pydantic-settings>=2.0
 redis>=4.5.4

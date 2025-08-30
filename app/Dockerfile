@@ -25,5 +25,5 @@ USER app
 # Открываем порт
 EXPOSE 8080
 
-# Команда запуска с gunicorn для production
-CMD ["python", "-m", "gunicorn", "--bind", "0.0.0.0:8080", "--worker-class", "aiohttp.GunicornWebWorker", "--workers", "1", "webhook_server:init_app"]
+# ИСПРАВЛЕННАЯ команда запуска - используем объект app вместо функции init_app
+CMD ["python", "-m", "gunicorn", "--bind", "0.0.0.0:8080", "--worker-class", "aiohttp.GunicornWebWorker", "--workers", "1", "--access-logfile", "-", "--error-logfile", "-", "--log-level", "info", "webhook_server:app"]

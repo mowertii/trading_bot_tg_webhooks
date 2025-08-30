@@ -6,7 +6,6 @@ from trading.order_executor import OrderExecutor
 import os
 import logging
 import asyncio
-from tinkoff.invest import AsyncClient, OrderType, StopOrderType
 
 logger = logging.getLogger(__name__)
 
@@ -37,52 +36,37 @@ async def handle_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for pos in positions:
             try:
                 logger.info(f"Закрываем позицию: {pos.ticker} ({pos.direction}) - {pos.lots} лотов")
-                await executor.execute_smart_order(
+                result = await executor.execute_smart_order(
                     figi=pos.figi,
                     desired_direction=pos.direction,
                     amount=0,  # Не используется при close_only=True
                     close_only=True
                 )
-                closed_count += 1
+                
+                if result.success:
+                    closed_count += 1
+                else:
+                    logger.error(f"Ошибка закрытия позиции {pos.ticker}: {result.message}")
+                    
                 await asyncio.sleep(0.5)  # Небольшая пауза между закрытиями
                 
             except Exception as e:
                 logger.error(f"Ошибка закрытия позиции {pos.ticker}: {str(e)}")
                 await message.reply_text(f"⚠️ Ошибка закрытия позиции {pos.ticker}: {str(e)}")
         
-        # Снимаем все активные ордера
-        async with AsyncClient(tinkoff_token) as api_client:
-            # Отменяем все лимитные ордера
-            limit_orders = await api_client.orders.get_orders(account_id=account_id)
+        # Снимаем все активные ордера (как лимитные, так и стоп-ордера)
+        try:
+            cancelled = await executor.cancel_all_orders()
+            limit_cancelled = cancelled["limit_orders"]
+            stop_cancelled = cancelled["stop_orders"]
+            
+            logger.info(f"Отменено ордеров: лимитных={limit_cancelled}, стоп={stop_cancelled}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка отмены ордеров: {str(e)}")
             limit_cancelled = 0
-            
-            for order in limit_orders.orders:
-                try:
-                    await api_client.orders.cancel_order(
-                        account_id=account_id, 
-                        order_id=order.order_id
-                    )
-                    limit_cancelled += 1
-                    logger.info(f"Отменен лимитный ордер: {order.order_id}")
-                    
-                except Exception as e:
-                    logger.error(f"Ошибка отмены лимитного ордера {order.order_id}: {str(e)}")
-            
-            # Отменяем все стоп-ордера
-            stop_orders = await api_client.stop_orders.get_stop_orders(account_id=account_id)
             stop_cancelled = 0
-            
-            for stop_order in stop_orders.stop_orders:
-                try:
-                    await api_client.stop_orders.cancel_stop_order(
-                        account_id=account_id, 
-                        stop_order_id=stop_order.stop_order_id
-                    )
-                    stop_cancelled += 1
-                    logger.info(f"Отменен стоп-ордер: {stop_order.stop_order_id}")
-                    
-                except Exception as e:
-                    logger.error(f"Ошибка отмены стоп-ордера {stop_order.stop_order_id}: {str(e)}")
+            await message.reply_text(f"⚠️ Ошибка отмены ордеров: {str(e)}")
         
         # Формируем итоговый отчет
         summary_lines = [
