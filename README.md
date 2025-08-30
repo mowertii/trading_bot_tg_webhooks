@@ -61,7 +61,7 @@
 
 ### 1. Клонируем проект
 ```bash
-git clone https://github.com/yourname/trading_bot_tg_webhooks.git
+git clone git@github.com:mowertii/trading_bot_tg_webhooks.git
 cd trading_bot_tg_webhooks
 ```
 
