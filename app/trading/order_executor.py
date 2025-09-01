@@ -1,184 +1,32 @@
-# app/trading/order_executor.py
-import asyncio
 import logging
-from decimal import Decimal
-from typing import Optional, List
+import asyncio
+from decimal import Decimal, ROUND_DOWN
 from dataclasses import dataclass
-
-from tinkoff.invest import (
-    AsyncClient, 
-    OrderDirection, 
-    OrderType, 
-    MoneyValue,
-    Quotation,
-    StopOrderDirection,
-    StopOrderExpirationType,
-    StopOrderType
-)
-
-from trading.tinkoff_client import TinkoffClient, Position
-from trading.settings_manager import get_settings
+from typing import Optional, Dict, Any
+from tinkoff.invest import AsyncClient, OrderDirection, OrderType, RequestError
+from .tinkoff_client import TinkoffClient
+import uuid
+import time
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class OrderResult:
-    """Результат выставления ордера"""
-    order_id: str
     success: bool
     message: str
-    price: Optional[Decimal] = None
-    quantity: Optional[int] = None
+    order_id: Optional[str] = None
+    executed_price: Optional[Decimal] = None
+    executed_lots: Optional[int] = None
+    details: Optional[Dict[str, Any]] = None
+
 
 class OrderExecutor:
     def __init__(self, token: str, account_id: str):
         self.token = token
         self.account_id = account_id
         self.client = TinkoffClient(token, account_id)
-
-    def _money_value_to_decimal(self, money: MoneyValue) -> Decimal:
-        """Конвертация MoneyValue в Decimal"""
-        return Decimal(str(money.units)) + Decimal(str(money.nano)) / Decimal("1000000000")
-
-    def _quotation_to_decimal(self, quotation: Quotation) -> Decimal:
-        """Конвертация Quotation в Decimal"""
-        return Decimal(str(quotation.units)) + Decimal(str(quotation.nano)) / Decimal("1000000000")
-
-    def _decimal_to_quotation(self, value: Decimal) -> Quotation:
-        """Конвертация Decimal в Quotation"""
-        units = int(value)
-        nano = int((value - units) * Decimal("1000000000"))
-        return Quotation(units=units, nano=nano)
-
-    async def get_current_price(self, figi: str) -> Decimal:
-        """Получение текущей цены инструмента"""
-        async with AsyncClient(self.token) as api_client:
-            # Получаем стакан котировок
-            orderbook = await api_client.market_data.get_order_book(
-                figi=figi,
-                depth=1
-            )
-            
-            if orderbook.bids and orderbook.asks:
-                bid = self._quotation_to_decimal(orderbook.bids[0].price)
-                ask = self._quotation_to_decimal(orderbook.asks[0].price)
-                return (bid + ask) / 2
-            
-            # Если стакан пустой, получаем последнюю цену
-            candles = await api_client.market_data.get_candles(
-                figi=figi,
-                from_=None,
-                to=None,
-                interval=1  # 1 минута
-            )
-            
-            if candles.candles:
-                return self._quotation_to_decimal(candles.candles[-1].close)
-            
-            raise ValueError(f"Не удалось получить цену для {figi}")
-
-    async def place_market_order(
-        self, 
-        figi: str, 
-        direction: OrderDirection, 
-        quantity: int
-    ) -> OrderResult:
-        """Выставление рыночного ордера"""
-        try:
-            async with AsyncClient(self.token) as api_client:
-                response = await api_client.orders.post_order(
-                    figi=figi,
-                    quantity=quantity,
-                    direction=direction,
-                    account_id=self.account_id,
-                    order_type=OrderType.ORDER_TYPE_MARKET,
-                    order_id=f"market_{figi}_{direction.name}_{quantity}"
-                )
-                
-                executed_price = self._money_value_to_decimal(response.executed_order_price)
-                
-                logger.info(f"Market order executed: {response.order_id}, price: {executed_price}")
-                
-                return OrderResult(
-                    order_id=response.order_id,
-                    success=True,
-                    message=f"Market order executed at {executed_price}",
-                    price=executed_price,
-                    quantity=quantity
-                )
-                
-        except Exception as e:
-            logger.error(f"Market order error: {e}")
-            return OrderResult(
-                order_id="",
-                success=False,
-                message=str(e)
-            )
-
-    async def place_stop_order(
-        self,
-        figi: str,
-        direction: StopOrderDirection,
-        quantity: int,
-        stop_price: Decimal,
-        order_type: StopOrderType = StopOrderType.STOP_ORDER_TYPE_STOP_LOSS
-    ) -> OrderResult:
-        """Выставление стоп-ордера (НЕ лимитного!)"""
-        try:
-            async with AsyncClient(self.token) as api_client:
-                # Получаем информацию об инструменте для правильного форматирования цены
-                instrument = await api_client.instruments.get_instrument_by(
-                    id_type=1,  # FIGI
-                    id=figi
-                )
-                
-                # Конвертируем цену в правильный формат
-                stop_price_quotation = self._decimal_to_quotation(stop_price)
-                
-                response = await api_client.stop_orders.post_stop_order(
-                    figi=figi,
-                    quantity=quantity,
-                    direction=direction,
-                    account_id=self.account_id,
-                    expiration_type=StopOrderExpirationType.STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL,
-                    stop_order_type=order_type,
-                    expire_date=None,
-                    stop_price=stop_price_quotation
-                )
-                
-                logger.info(f"Stop order placed: {response.stop_order_id}, stop price: {stop_price}")
-                
-                return OrderResult(
-                    order_id=response.stop_order_id,
-                    success=True,
-                    message=f"Stop order placed at {stop_price}",
-                    price=stop_price,
-                    quantity=quantity
-                )
-                
-        except Exception as e:
-            logger.error(f"Stop order error: {e}")
-            return OrderResult(
-                order_id="",
-                success=False,
-                message=str(e)
-            )
-
-    async def place_take_profit_order(
-        self,
-        figi: str,
-        direction: StopOrderDirection,
-        quantity: int,
-        take_profit_price: Decimal
-    ) -> OrderResult:
-        """Выставление Take-Profit ордера как стоп-ордера"""
-        return await self.place_stop_order(
-            figi=figi,
-            direction=direction,
-            quantity=quantity,
-            stop_price=take_profit_price,
-            order_type=StopOrderType.STOP_ORDER_TYPE_TAKE_PROFIT
-        )
+        self._last_price_per_lot: Optional[Decimal] = None
 
     async def execute_smart_order(
         self,
@@ -186,163 +34,225 @@ class OrderExecutor:
         desired_direction: str,
         amount: Decimal,
         close_only: bool = False
-    ):
-        """Умное выставление ордера с автоматическим TP/SL"""
+    ) -> OrderResult:
         try:
-            # Получаем настройки
-            settings = get_settings()
-            
-            # Получаем информацию об инструменте
-            async with AsyncClient(self.token) as api_client:
-                instrument = await api_client.instruments.get_instrument_by(
-                    id_type=1,  # FIGI
-                    id=figi
-                )
-                
-                lot_size = instrument.instrument.lot
-                current_price = await self.get_current_price(figi)
-                
-                # Если это закрытие позиции
-                if close_only:
-                    positions = await self.client.get_positions_async()
-                    target_pos = next((p for p in positions if p.figi == figi), None)
-                    
-                    if target_pos:
-                        # Определяем направление закрытия
-                        close_direction = (
-                            OrderDirection.ORDER_DIRECTION_SELL 
-                            if target_pos.direction == "long" 
-                            else OrderDirection.ORDER_DIRECTION_BUY
-                        )
-                        
-                        # Закрываем рыночным ордером
-                        result = await self.place_market_order(
-                            figi=figi,
-                            direction=close_direction,
-                            quantity=target_pos.lots
-                        )
-                        
-                        if result.success:
-                            logger.info(f"Position closed: {target_pos.ticker}")
-                        
-                        return result
-                    
-                    return OrderResult("", True, "No position to close")
-                
-                # Рассчитываем количество лотов
-                position_value = amount
-                lots_to_buy = max(1, int(position_value / (current_price * lot_size)))
-                
-                # Определяем направление ордера
-                order_direction = (
-                    OrderDirection.ORDER_DIRECTION_BUY 
-                    if desired_direction == "long" 
-                    else OrderDirection.ORDER_DIRECTION_SELL
-                )
-                
-                # Выставляем основной рыночный ордер
-                main_result = await self.place_market_order(
-                    figi=figi,
-                    direction=order_direction,
-                    quantity=lots_to_buy
-                )
-                
-                if not main_result.success:
-                    return main_result
-                
-                # Получаем цену исполнения основного ордера
-                execution_price = main_result.price
-                
-                # Рассчитываем уровни TP и SL
-                if desired_direction == "long":
-                    # Для лонга: SL ниже, TP выше
-                    sl_price = execution_price * (1 - settings.stop_loss_percent / 100)
-                    tp_price = execution_price * (1 + settings.take_profit_percent / 100)
-                    
-                    sl_direction = StopOrderDirection.STOP_ORDER_DIRECTION_SELL
-                    tp_direction = StopOrderDirection.STOP_ORDER_DIRECTION_SELL
-                else:
-                    # Для шорта: SL выше, TP ниже  
-                    sl_price = execution_price * (1 + settings.stop_loss_percent / 100)
-                    tp_price = execution_price * (1 - settings.take_profit_percent / 100)
-                    
-                    sl_direction = StopOrderDirection.STOP_ORDER_DIRECTION_BUY
-                    tp_direction = StopOrderDirection.STOP_ORDER_DIRECTION_BUY
-                
-                # Выставляем стоп-лосс как стоп-ордер
-                sl_result = await self.place_stop_order(
-                    figi=figi,
-                    direction=sl_direction,
-                    quantity=lots_to_buy,
-                    stop_price=sl_price,
-                    order_type=StopOrderType.STOP_ORDER_TYPE_STOP_LOSS
-                )
-                
-                # Выставляем тейк-профит как стоп-ордер
-                tp_result = await self.place_take_profit_order(
-                    figi=figi,
-                    direction=tp_direction,
-                    quantity=lots_to_buy,
-                    take_profit_price=tp_price
-                )
-                
-                # Логируем результаты
-                success_msg = [f"Main order: {main_result.message}"]
-                if sl_result.success:
-                    success_msg.append(f"SL: {sl_price:.4f}")
-                if tp_result.success:
-                    success_msg.append(f"TP: {tp_price:.4f}")
-                
-                logger.info(f"Smart order completed: {'; '.join(success_msg)}")
-                
-                return OrderResult(
-                    order_id=main_result.order_id,
-                    success=True,
-                    message=f"Order executed with SL/TP: {execution_price:.4f}",
-                    price=execution_price,
-                    quantity=lots_to_buy
-                )
-                
-        except Exception as e:
-            logger.error(f"Smart order error: {e}", exc_info=True)
-            return OrderResult(
-                order_id="",
-                success=False,
-                message=str(e)
-            )
+            logger.info(f"Executing smart order: {desired_direction} {figi}, amount={amount}, close_only={close_only}")
 
-    async def cancel_all_orders(self) -> dict:
-        """Отмена всех активных ордеров"""
+            instrument_info = await self._get_instrument_info(figi)
+            if not instrument_info:
+                return OrderResult(False, f"Не удалось получить информацию об инструменте {figi}")
+
+            ticker = instrument_info.get("ticker", figi)
+
+            positions = await self.client.get_positions_async()
+            current_position = next((p for p in positions if p.figi == figi), None)
+
+            if close_only:
+                return await self._close_position(current_position, figi, ticker)
+
+            lots_to_trade = await self._calculate_lots(figi, amount, instrument_info)
+            if lots_to_trade <= 0:
+                ppl = self._last_price_per_lot
+                if ppl:
+                    return OrderResult(
+                        success=False,
+                        message=(
+                            f"Сумма позиции недостаточна для 1 лота {ticker}. "
+                            f"Рассчитано: {self._fmt_money(amount)}, 1 лот ≈ {self._fmt_money(ppl)}"
+                        ),
+                    )
+                return OrderResult(
+                    success=False,
+                    message=f"Сумма позиции недостаточна для торговли {ticker}: {self._fmt_money(amount)}"
+                )
+
+            if desired_direction == "long":
+                result = await self._execute_buy_order(figi, lots_to_trade, ticker)
+            elif desired_direction == "short":
+                result = await self._execute_sell_order(figi, lots_to_trade, ticker)
+            else:
+                return OrderResult(False, f"Неподдерживаемое направление: {desired_direction}")
+
+            if result.success:
+                result.details = {
+                    "ticker": ticker,
+                    "direction": desired_direction,
+                    "lots_traded": lots_to_trade,
+                    "amount_used": str(self._fmt_money(amount))
+                }
+                result.message = f"{result.message} Торговано: {lots_to_trade} лот(ов)"
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error in execute_smart_order: {e}", exc_info=True)
+            return OrderResult(False, f"Системная ошибка при выполнении ордера: {str(e)}")
+
+    async def _get_instrument_info(self, figi: str) -> Optional[Dict[str, Any]]:
+        try:
+            async with AsyncClient(self.token) as client:
+                response = await client.instruments.get_instrument_by(id_type=1, id=figi)
+                if response and response.instrument:
+                    return {
+                        "ticker": response.instrument.ticker,
+                        "lot": response.instrument.lot,
+                        "currency": response.instrument.currency,
+                        "min_price_increment": response.instrument.min_price_increment
+                    }
+                return None
+        except Exception as e:
+            logger.error(f"Error getting instrument info for {figi}: {e}")
+            return None
+
+    async def _calculate_lots(self, figi: str, amount: Decimal, instrument_info: Dict) -> int:
+        """Рассчитываем количество лотов; безопасный парсинг стакана с фоллбэком на last_price."""
+        try:
+            async with AsyncClient(self.token) as client:
+                ob = await client.market_data.get_order_book(figi=figi, depth=1)
+
+                current_price: Optional[Decimal] = None
+
+                # bids/asks могут быть списками записей, у каждой есть поле price (Quotation)
+                # Берем среднюю между лучшим бидом и аском, если есть
+                try:
+                    has_bid = bool(ob.bids)
+                    has_ask = bool(ob.asks)
+                    if has_bid and has_ask:
+                        bid0 = ob.bids[0]
+                        ask0 = ob.asks[0]
+                        bid_price_q = getattr(bid0, "price", None)
+                        ask_price_q = getattr(ask0, "price", None)
+                        if bid_price_q and ask_price_q:
+                            best_bid = self._quotation_to_decimal(bid_price_q)
+                            best_ask = self._quotation_to_decimal(ask_price_q)
+                            current_price = (best_bid + best_ask) / 2
+                except Exception as e:
+                    logger.warning(f"OrderBook top levels parse issue for {figi}: {e}")
+
+                if current_price is None:
+                    lp = getattr(ob, "last_price", None)
+                    if lp:
+                        current_price = self._quotation_to_decimal(lp)
+
+                if current_price is None or current_price <= 0:
+                    logger.error(f"No valid price in orderbook for {figi}")
+                    return 0
+
+                lot_size = int(instrument_info.get("lot", 1) or 1)
+                price_per_lot = (current_price * Decimal(lot_size)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                self._last_price_per_lot = price_per_lot
+
+                lots = int((amount / price_per_lot).to_integral_value(rounding=ROUND_DOWN))
+                logger.info(f"Calculated lots: {lots} (price_per_lot: {price_per_lot}, amount: {amount})")
+                return lots
+
+        except Exception as e:
+            logger.error(f"Error calculating lots: {e}")
+            return 0
+
+    async def _close_position(self, position, figi: str, ticker: str) -> OrderResult:
+        if not position:
+            return OrderResult(True, f"Позиция по {ticker} отсутствует, закрытие не требуется")
+
+        try:
+            if position.direction == "long":
+                result = await self._execute_sell_order(figi, position.lots, ticker, closing=True)
+            else:
+                result = await self._execute_buy_order(figi, position.lots, ticker, closing=True)
+
+            if result.success:
+                result.message = f"Закрыта {position.direction} позиция по {ticker}: {position.lots} лот(ов)"
+            return result
+
+        except Exception as e:
+            logger.error(f"Error closing position: {e}")
+            return OrderResult(False, f"Ошибка закрытия позиции {ticker}: {str(e)}")
+
+    async def _execute_buy_order(self, figi: str, lots: int, ticker: str, closing: bool = False) -> OrderResult:
+        try:
+            async with AsyncClient(self.token) as client:
+                order_response = await client.orders.post_order(
+                    order_id="",  # Pass empty string to let API assign UUID
+                    figi=figi,
+                    quantity=lots,
+                    direction=OrderDirection.ORDER_DIRECTION_BUY,
+                    account_id=self.account_id,
+                    order_type=OrderType.ORDER_TYPE_MARKET
+                )
+                if order_response:
+                    action_text = "закрытия позиции" if closing else "покупки"
+                    return OrderResult(True, f"Ордер {action_text} {ticker} успешно размещен",
+                                       order_id=order_response.order_id,
+                                       executed_lots=lots)
+                return OrderResult(False, f"Не удалось разместить ордер покупки {ticker}")
+
+        except RequestError as e:
+            logger.error(f"Tinkoff API error in buy order: {e}")
+            return OrderResult(False, f"Ошибка API при покупке {ticker}: {e.details}")
+        except Exception as e:
+            logger.error(f"Error in buy order: {e}")
+            return OrderResult(False, f"Системная ошибка при покупке {ticker}: {str(e)}")
+
+    async def _execute_sell_order(self, figi: str, lots: int, ticker: str, closing: bool = False) -> OrderResult:
+        try:
+            async with AsyncClient(self.token) as client:
+                order_response = await client.orders.post_order(
+                    order_id="",  # Pass empty string to let API assign UUID
+                    figi=figi,
+                    quantity=lots,
+                    direction=OrderDirection.ORDER_DIRECTION_SELL,
+                    account_id=self.account_id,
+                    order_type=OrderType.ORDER_TYPE_MARKET
+                )
+                if order_response:
+                    action_text = "закрытия позиции" if closing else "продажи"
+                    return OrderResult(True, f"Ордер {action_text} {ticker} успешно размещен",
+                                       order_id=order_response.order_id,
+                                       executed_lots=lots)
+                return OrderResult(False, f"Не удалось разместить ордер продажи {ticker}")
+
+        except RequestError as e:
+            logger.error(f"Tinkoff API error in sell order: {e}")
+            return OrderResult(False, f"Ошибка API при продаже {ticker}: {e.details}")
+        except Exception as e:
+            logger.error(f"Error in sell order: {e}")
+            return OrderResult(False, f"Системная ошибка при продаже {ticker}: {str(e)}")
+
+    async def cancel_all_orders(self) -> Dict[str, int]:
         try:
             cancelled = {"limit_orders": 0, "stop_orders": 0}
-            
-            async with AsyncClient(self.token) as api_client:
-                # Отменяем лимитные ордера
-                limit_orders = await api_client.orders.get_orders(account_id=self.account_id)
-                for order in limit_orders.orders:
+            async with AsyncClient(self.token) as client:
+                orders_response = await client.orders.get_orders(account_id=self.account_id)
+                for order in orders_response.orders:
                     try:
-                        await api_client.orders.cancel_order(
-                            account_id=self.account_id,
-                            order_id=order.order_id
-                        )
+                        await client.orders.cancel_order(account_id=self.account_id, order_id=order.order_id)
                         cancelled["limit_orders"] += 1
+                        logger.info(f"Cancelled limit order: {order.order_id}")
                     except Exception as e:
-                        logger.error(f"Failed to cancel limit order {order.order_id}: {e}")
-                
-                # Отменяем стоп-ордера
-                stop_orders = await api_client.stop_orders.get_stop_orders(account_id=self.account_id)
-                for stop_order in stop_orders.stop_orders:
+                        logger.error(f"Error cancelling limit order {order.order_id}: {e}")
+
+                stop_orders_response = await client.stop_orders.get_stop_orders(account_id=self.account_id)
+                for stop_order in stop_orders_response.stop_orders:
                     try:
-                        await api_client.stop_orders.cancel_stop_order(
+                        await client.stop_orders.cancel_stop_order(
                             account_id=self.account_id,
                             stop_order_id=stop_order.stop_order_id
                         )
                         cancelled["stop_orders"] += 1
+                        logger.info(f"Cancelled stop order: {stop_order.stop_order_id}")
                     except Exception as e:
-                        logger.error(f"Failed to cancel stop order {stop_order.stop_order_id}: {e}")
-            
+                        logger.error(f"Error cancelling stop order {stop_order.stop_order_id}: {e}")
             return cancelled
-            
         except Exception as e:
-            logger.error(f"Cancel all orders error: {e}")
-            raise
+            logger.error(f"Error cancelling orders: {e}")
+            return {"limit_orders": 0, "stop_orders": 0}
+
+    def _quotation_to_decimal(self, quotation) -> Decimal:
+        # quotation имеет поля units (int64) и nano (int32)
+        return Decimal(str(quotation.units)) + Decimal(str(quotation.nano)) / Decimal("1000000000")
+
+    def _fmt_money(self, x: Decimal) -> Decimal:
+        return x.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+    def _generate_order_id(self) -> str:
+        return ""  # оставляем пустым, чтобы API сам создал UUID
