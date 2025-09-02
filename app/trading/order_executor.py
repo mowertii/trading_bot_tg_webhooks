@@ -40,10 +40,11 @@ class OrderExecutor:
         figi: str,
         desired_direction: str,
         amount: Decimal,
-        close_only: bool = False
+        close_only: bool = False,
+        lots_override: int | None = None  # НОВЫЙ ПАРАМЕТР
     ) -> OrderResult:
         try:
-            logger.info(f"Executing smart order: {desired_direction} {figi}, amount={amount}, close_only={close_only}")
+            logger.info(f"Executing smart order: {desired_direction} {figi}, amount={amount}, close_only={close_only}, lots_override={lots_override}")
 
             instrument_info = await self._get_instrument_info(figi)
             if not instrument_info:
@@ -56,21 +57,26 @@ class OrderExecutor:
             if close_only:
                 return await self._close_position(current_position, figi, ticker)
 
-            lots_to_trade = await self._calculate_lots(figi, amount, instrument_info)
-            if lots_to_trade <= 0:
-                ppl = self._last_price_per_lot
-                if ppl:
+            # ИЗМЕНЕНИЕ: используем lots_override если указан
+            if lots_override is not None:
+                lots_to_trade = lots_override
+                logger.info(f"Using lots override: {lots_to_trade}")
+            else:
+                lots_to_trade = await self._calculate_lots(figi, amount, instrument_info)
+                if lots_to_trade <= 0:
+                    ppl = self._last_price_per_lot
+                    if ppl:
+                        return OrderResult(
+                            success=False,
+                            message=(
+                                f"Сумма позиции недостаточна для 1 лота {ticker}. "
+                                f"Рассчитано: {self._fmt_money(amount)}, 1 лот ≈ {self._fmt_money(ppl)}"
+                            ),
+                        )
                     return OrderResult(
                         success=False,
-                        message=(
-                            f"Сумма позиции недостаточна для 1 лота {ticker}. "
-                            f"Рассчитано: {self._fmt_money(amount)}, 1 лот ≈ {self._fmt_money(ppl)}"
-                        ),
+                        message=f"Сумма позиции недостаточна для торговли {ticker}: {self._fmt_money(amount)}"
                     )
-                return OrderResult(
-                    success=False,
-                    message=f"Сумма позиции недостаточна для торговли {ticker}: {self._fmt_money(amount)}"
-                )
 
             if desired_direction == "long":
                 result = await self._execute_buy_order(figi, lots_to_trade, ticker)
@@ -339,8 +345,59 @@ class OrderExecutor:
             logger.error(f"Error in buy order: {e}")
             return OrderResult(False, f"Системная ошибка при покупке {ticker}: {str(e)}")
 
+    async def _check_margin_requirements(self, figi: str, direction: str, lots: int) -> tuple[bool, str]:
+        """
+        Проверяет маржинальные требования перед размещением ордера
+        """
+        try:
+            async with AsyncClient(self.token) as client:
+                # Проверяем торговый статус инструмента
+                trading_status = await client.market_data.get_trading_status(figi=figi)
+                
+                if not trading_status.api_trade_available_flag:
+                    return False, "Торговля через API недоступна для данного инструмента"
+                
+                # Для шорт-позиций проверяем доступность маржинальной торговли
+                if direction == "short":
+                    try:
+                        # Получаем маржинальные атрибуты счета
+                        margin_attrs = await client.users.get_margin_attributes(account_id=self.account_id)
+                        
+                        # Проверяем что маржинальная торговля включена
+                        if not margin_attrs:
+                            return False, "Маржинальная торговля отключена для данного счета"
+                        
+                        # Получаем информацию об инструменте
+                        instrument_resp = await client.instruments.get_instrument_by(id_type=1, id=figi)
+                        if not instrument_resp or not instrument_resp.instrument:
+                            return False, "Не удалось получить информацию об инструменте"
+                        
+                        ticker = instrument_resp.instrument.ticker
+                        
+                        # Проверяем что инструмент доступен для шорта
+                        if not getattr(instrument_resp.instrument, 'short_enabled_flag', False):
+                            return False, f"Инструмент {ticker} недоступен для продажи в шорт"
+                        
+                        logger.info(f"Margin check passed for short {ticker}")
+                        
+                    except Exception as margin_error:
+                        logger.warning(f"Margin check failed: {margin_error}")
+                        return False, f"Недостаточно средств для маржинальной торговли: {str(margin_error)}"
+                
+                return True, "OK"
+                
+        except Exception as e:
+            logger.error(f"Error checking margin requirements: {e}")
+            return False, f"Ошибка проверки маржинальных требований: {str(e)}"
+
     async def _execute_sell_order(self, figi: str, lots: int, ticker: str, closing: bool = False) -> OrderResult:
         try:
+            # НОВОЕ: проверяем маржинальные требования для шорт-позиций
+            if not closing:
+                margin_ok, margin_msg = await self._check_margin_requirements(figi, "short", lots)
+                if not margin_ok:
+                    return OrderResult(False, f"Маржинальные требования: {margin_msg}")
+            
             async with AsyncClient(self.token) as client:
                 order_response = await client.orders.post_order(
                     order_id="",
@@ -353,13 +410,16 @@ class OrderExecutor:
                 if order_response:
                     action_text = "закрытия позиции" if closing else "продажи"
                     return OrderResult(True, f"Ордер {action_text} {ticker} успешно размещен",
-                                       order_id=order_response.order_id,
-                                       executed_lots=lots)
+                                    order_id=order_response.order_id,
+                                    executed_lots=lots)
                 return OrderResult(False, f"Не удалось разместить ордер продажи {ticker}")
 
         except RequestError as e:
             logger.error(f"Tinkoff API error in sell order: {e}")
-            return OrderResult(False, f"Ошибка API при продаже {ticker}: {e.details}")
+            error_msg = str(e.details) if hasattr(e, 'details') else str(e)
+            if "30042" in error_msg or "margin" in error_msg.lower():
+                return OrderResult(False, f"Недостаточно средств для маржинальной торговли {ticker}")
+            return OrderResult(False, f"Ошибка API при продаже {ticker}: {error_msg}")
         except Exception as e:
             logger.error(f"Error in sell order: {e}")
             return OrderResult(False, f"Системная ошибка при продаже {ticker}: {str(e)}")

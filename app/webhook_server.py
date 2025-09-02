@@ -1,4 +1,4 @@
-# app/webhook_server.py - исправлено: отправка в TG, учёт плеча, округление
+# app/webhook_server.py - ИСПРАВЛЕННАЯ ВЕРСИЯ с поддержкой quantity
 import os
 import json
 import hmac
@@ -7,6 +7,7 @@ import logging
 from aiohttp import web, web_request
 from decimal import Decimal, ROUND_DOWN
 import asyncio
+from typing import Optional
 
 from trading.tinkoff_client import TinkoffClient
 from trading.order_executor import OrderExecutor
@@ -61,22 +62,30 @@ def _fmt_money(x: Decimal) -> str:
     return f"{x.quantize(Decimal('0.01'), rounding=ROUND_DOWN)} RUB"
 
 
-async def process_trade_webhook(action: str, symbol: str, risk_percent: float | None = None):
+async def process_trade_webhook(action: str, symbol: str, risk_percent: float | None = None, quantity: int | None = None):
     try:
         client = TinkoffClient(tinkoff_token, account_id)
         executor = OrderExecutor(tinkoff_token, account_id)
-
+        
+        # Настройки риска
         settings = get_settings()
         if risk_percent is None:
             if action == "buy":
                 risk_percent = settings.risk_long_percent / 100.0
-            elif action == "sell":
+            else:
                 risk_percent = settings.risk_short_percent / 100.0
 
         risk_d = Decimal(str(risk_percent or 0))
-        await send_notification(
-            f"✅ {action.upper()} {symbol}: риск {_fmt_pct(risk_d * 100)}, плечо {leverage}"
-        )
+        
+        # Формируем сообщение в зависимости от режима торговли
+        if quantity is not None:
+            await send_notification(
+                f"✅ {action.upper()} {symbol}: {quantity} лот(ов), плечо {leverage}"
+            )
+        else:
+            await send_notification(
+                f"✅ {action.upper()} {symbol}: риск {_fmt_pct(risk_d * 100)}, плечо {leverage}"
+            )
 
         figi = await client.get_figi(symbol)
         if not figi:
@@ -85,9 +94,9 @@ async def process_trade_webhook(action: str, symbol: str, risk_percent: float | 
         positions = await client.get_positions_async()
 
         if action == "buy":
-            result = await _execute_buy_operation(client, executor, figi, symbol, positions, risk_d)
+            result = await _execute_buy_operation(client, executor, figi, symbol, positions, risk_d, quantity)
         elif action == "sell":
-            result = await _execute_sell_operation(client, executor, figi, symbol, positions, risk_d)
+            result = await _execute_sell_operation(client, executor, figi, symbol, positions, risk_d, quantity)
         else:
             raise WebhookError(f"Неподдерживаемое действие: {action}")
 
@@ -109,7 +118,7 @@ async def _amount_with_leverage(client: TinkoffClient, figi: str, risk_d: Decima
     bal_d = Decimal(str(balance))
     amount = (bal_d * risk_d * leverage).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-    # Оценка цены лота (фоллбэк на last_price) — логика в executor синхронизирована
+    # Оценка цены лота (фоллбэк на last_price)
     from tinkoff.invest import AsyncClient
     price_per_lot = Decimal("0")
     try:
@@ -118,7 +127,8 @@ async def _amount_with_leverage(client: TinkoffClient, figi: str, risk_d: Decima
             current_price: Optional[Decimal] = None
             try:
                 if ob.bids and ob.asks:
-                    bid0 = ob.bids; ask0 = ob.asks
+                    bid0 = ob.bids[0]
+                    ask0 = ob.asks[0]
                     if getattr(bid0, "price", None) and getattr(ask0, "price", None):
                         best_bid = Decimal(str(bid0.price.units)) + Decimal(str(bid0.price.nano)) / Decimal("1e9")
                         best_ask = Decimal(str(ask0.price.units)) + Decimal(str(ask0.price.nano)) / Decimal("1e9")
@@ -143,7 +153,7 @@ async def _amount_with_leverage(client: TinkoffClient, figi: str, risk_d: Decima
     return amount, price_per_lot
 
 
-async def _execute_buy_operation(client, executor, figi, symbol, positions, risk_d: Decimal):
+async def _execute_buy_operation(client, executor, figi, symbol, positions, risk_d: Decimal, quantity: int | None = None):
     try:
         short_position = next((p for p in positions if p.ticker == symbol and p.direction == "short"), None)
         if short_position:
@@ -153,16 +163,23 @@ async def _execute_buy_operation(client, executor, figi, symbol, positions, risk
                 return {"success": False, "error": f"Не удалось закрыть короткую позицию: {close_result.message}"}
             await asyncio.sleep(1)
 
-        amount, price_per_lot = await _amount_with_leverage(client, figi, risk_d)
-        if amount <= 0:
-            return {"success": False, "error": "Недостаточно средств"}
-        if price_per_lot > 0 and amount < price_per_lot:
-            return {
-                "success": False,
-                "error": f"Сумма позиции {_fmt_money(amount)} меньше цены 1 лота ≈ {_fmt_money(price_per_lot)}"
-            }
+        # Если quantity указан, используем его; иначе вычисляем по риску
+        if quantity is not None:
+            # При фиксированном количестве лотов расчитываем приблизительную сумму для логирования
+            _, price_per_lot = await _amount_with_leverage(client, figi, risk_d)
+            amount = Decimal(quantity) * price_per_lot
+            buy_result = await executor.execute_smart_order(figi=figi, desired_direction="long", amount=amount, lots_override=quantity)
+        else:
+            amount, price_per_lot = await _amount_with_leverage(client, figi, risk_d)
+            if amount <= 0:
+                return {"success": False, "error": "Недостаточно средств"}
+            if price_per_lot > 0 and amount < price_per_lot:
+                return {
+                    "success": False,
+                    "error": f"Сумма позиции {_fmt_money(amount)} меньше цены 1 лота ≈ {_fmt_money(price_per_lot)}"
+                }
+            buy_result = await executor.execute_smart_order(figi=figi, desired_direction="long", amount=amount)
 
-        buy_result = await executor.execute_smart_order(figi=figi, desired_direction="long", amount=amount)
         if buy_result.success:
             return {"success": True, "details": f"Сумма: {_fmt_money(amount)}; {buy_result.message}"}
         return {"success": False, "error": buy_result.message}
@@ -171,7 +188,7 @@ async def _execute_buy_operation(client, executor, figi, symbol, positions, risk
         return {"success": False, "error": str(e)}
 
 
-async def _execute_sell_operation(client, executor, figi, symbol, positions, risk_d: Decimal):
+async def _execute_sell_operation(client, executor, figi, symbol, positions, risk_d: Decimal, quantity: int | None = None):
     try:
         long_position = next((p for p in positions if p.ticker == symbol and p.direction == "long"), None)
         if long_position:
@@ -181,16 +198,23 @@ async def _execute_sell_operation(client, executor, figi, symbol, positions, ris
                 return {"success": False, "error": f"Не удалось закрыть длинную позицию: {close_result.message}"}
             await asyncio.sleep(1)
 
-        amount, price_per_lot = await _amount_with_leverage(client, figi, risk_d)
-        if amount <= 0:
-            return {"success": False, "error": "Недостаточно средств"}
-        if price_per_lot > 0 and amount < price_per_lot:
-            return {
-                "success": False,
-                "error": f"Сумма позиции {_fmt_money(amount)} меньше цены 1 лота ≈ {_fmt_money(price_per_lot)}"
-            }
+        # Поддержка явного количества
+        if quantity is not None:
+            # При фиксированном количестве лотов расчитываем приблизительную сумму для логирования
+            _, price_per_lot = await _amount_with_leverage(client, figi, risk_d)
+            amount = Decimal(quantity) * price_per_lot
+            sell_result = await executor.execute_smart_order(figi=figi, desired_direction="short", amount=amount, lots_override=quantity)
+        else:
+            amount, price_per_lot = await _amount_with_leverage(client, figi, risk_d)
+            if amount <= 0:
+                return {"success": False, "error": "Недостаточно средств"}
+            if price_per_lot > 0 and amount < price_per_lot:
+                return {
+                    "success": False,
+                    "error": f"Сумма позиции {_fmt_money(amount)} меньше цены 1 лота ≈ {_fmt_money(price_per_lot)}"
+                }
+            sell_result = await executor.execute_smart_order(figi=figi, desired_direction="short", amount=amount)
 
-        sell_result = await executor.execute_smart_order(figi=figi, desired_direction="short", amount=amount)
         if sell_result.success:
             return {"success": True, "details": f"Сумма: {_fmt_money(amount)}; {sell_result.message}"}
         return {"success": False, "error": sell_result.message}
@@ -220,8 +244,11 @@ async def handle_webhook(request: web_request.Request):
             symbol = (data.get("symbol") or "").upper()
             if not symbol:
                 return web.json_response({"status": "error", "message": "Missing symbol field"}, status=400)
+            
             risk_percent = data.get("risk_percent")
-            result = await process_trade_webhook(action, symbol, risk_percent)
+            quantity = data.get("quantity")  # Новый параметр
+            
+            result = await process_trade_webhook(action, symbol, risk_percent, quantity)
             if result.get("success"):
                 return web.json_response({"status": "success", "result": f"✅ {action.upper()} {symbol} выполнен успешно"})
             return web.json_response({"status": "error", "message": result.get("error")}, status=500)

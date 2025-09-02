@@ -21,7 +21,7 @@
 ### 1. 📈 Торговые сигналы
 **POST** `/webhook`
 
-#### Покупка (BUY)
+#### Покупка (BUY) по риску в %
 ```json
 {
   "action": "buy",
@@ -30,12 +30,30 @@
 }
 ```
 
-#### Продажа (SELL)
+#### Продажа (SELL) по риску в %
 ```json
 {
   "action": "sell", 
   "symbol": "GAZP",
   "risk_percent": 0.3
+}
+```
+
+#### Покупка (BUY) строго по количеству лотов
+```json
+{
+  "action": "buy",
+  "symbol": "SBER",
+  "quantity": 22
+}
+```
+
+#### Продажа (SELL) строго по количеству лотов
+```json
+{
+  "action": "sell", 
+  "symbol": "GAZP",
+  "quantity": 22
 }
 ```
 
@@ -107,25 +125,35 @@ headers = {
 
 ## Примеры запросов
 
-### cURL
+### cURL с секретом вебхука в заголовке
 ```bash
 # Покупка SBER с риском 40%
-curl -X POST https://webhook.mowertii.ru/webhook \
+curl -X POST https://webhook.mowertii.ru/webhook?token=<WEBHOOK_SECRET> \
   -H 'Content-Type: application/json' \
   -d '{"action": "buy", "symbol": "SBER", "risk_percent": 0.4}'
 
 # Продажа GAZP с риском 30%  
-curl -X POST https://webhook.mowertii.ru/webhook \
+curl -X POST https://webhook.mowertii.ru/webhook?token=<WEBHOOK_SECRET> \
   -H 'Content-Type: application/json' \
   -d '{"action": "sell", "symbol": "GAZP", "risk_percent": 0.3}'
 
+# Покупка SBER по количеству 1
+curl -X POST https://webhook.mowertii.ru/webhook?token=<WEBHOOK_SECRET> \
+  -H 'Content-Type: application/json' \
+  -d '{"action": "buy", "symbol": "SBER", "quantity":1}'
+
+# Продажа GAZP по количеству 1  
+curl -X POST https://webhook.mowertii.ru/webhook?token=<WEBHOOK_SECRET> \
+  -H 'Content-Type: application/json' \
+  -d '{"action": "sell", "symbol": "GAZP", "quantity":1}'
+
 # Закрыть все позиции
-curl -X POST https://webhook.mowertii.ru/webhook \
+curl -X POST https://webhook.mowertii.ru/webhook?token=<WEBHOOK_SECRET> \
   -H 'Content-Type: application/json' \
   -d '{"action": "close_all"}'
 
 # Получить баланс
-curl -X POST https://webhook.mowertii.ru/webhook \
+curl -X POST https://webhook.mowertii.ru/webhook?token=<WEBHOOK_SECRET> \
   -H 'Content-Type: application/json' \
   -d '{"action": "balance"}'
 ```

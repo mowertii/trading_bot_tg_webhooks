@@ -120,13 +120,17 @@ docker-compose up --build -d
 
 Документация вынесена в [API_DOCUMENTATION.md](./API_DOCUMENTATION.md).
 
-Пример запроса:
+Примеры запросов:
+# открытие сделки по риску в % от доступных средств, с учётом плеча ЛОКАЛЬНО
 ```bash
 curl -X POST http://localhost:8080/webhook \
   -H "Content-Type: application/json" \
   -d '{"action": "buy", "symbol": "SBER", "risk_percent": 0.4}'
 ```
-
+# открытие сделок строго по количеству, игнорируя настройки риска УДАЛЁННО
+curl -X POST https://webhook.example.ru/webhook?token=<WEBHOOK_SECRET> \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"sell","symbol":"GZU5","quantity":1}'  
 ---
 
 ## 🛠️ Технологии
