@@ -1,3 +1,4 @@
+# app/trading/order_watcher.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
 import logging
 import asyncio
 from tinkoff.invest import AsyncClient
@@ -47,9 +48,8 @@ class OrderWatcher:
                         
                         # Если позиция была открыта и теперь закрыта
                         if prev_qty != 0 and current_qty == 0:
-                            # Отменяем все ордера по этому инструменту
-                            await self.executor._cancel_all_stop_orders(client, figi)
-                            await self.executor._cancel_all_limit_orders(client, figi)
+                            # Отменяем все ордера по этому инструменту через executor
+                            await self.executor._cancel_orders_for_figi(figi)
                             
                             msg = f"ℹ️ Позиция по {figi} закрыта. Все стопы и лимиты сняты."
                             logger.info(msg)

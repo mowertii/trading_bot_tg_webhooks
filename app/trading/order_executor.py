@@ -1,15 +1,22 @@
+# app/trading/order_executor.py - ПОЛНЫЙ ИСПРАВЛЕННЫЙ КОД
 import logging
 import asyncio
 from decimal import Decimal, ROUND_DOWN
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
-from tinkoff.invest import AsyncClient, OrderDirection, OrderType, RequestError
+from tinkoff.invest import (
+    AsyncClient, 
+    OrderDirection, 
+    OrderType, 
+    RequestError,
+    StopOrderDirection,
+    StopOrderExpirationType,
+    StopOrderType
+)
 from .tinkoff_client import TinkoffClient
-import uuid
-import time
+from trading.settings_manager import get_settings
 
 logger = logging.getLogger(__name__)
-
 
 @dataclass
 class OrderResult:
@@ -43,7 +50,6 @@ class OrderExecutor:
                 return OrderResult(False, f"Не удалось получить информацию об инструменте {figi}")
 
             ticker = instrument_info.get("ticker", figi)
-
             positions = await self.client.get_positions_async()
             current_position = next((p for p in positions if p.figi == figi), None)
 
@@ -82,11 +88,115 @@ class OrderExecutor:
                 }
                 result.message = f"{result.message} Торговано: {lots_to_trade} лот(ов)"
 
+                # Выставляем SL и TP после успешного открытия позиции
+                if not close_only:
+                    await self._place_tp_sl_orders(figi, desired_direction, lots_to_trade, result)
+
             return result
 
         except Exception as e:
             logger.error(f"Error in execute_smart_order: {e}", exc_info=True)
             return OrderResult(False, f"Системная ошибка при выполнении ордера: {str(e)}")
+
+    async def _place_tp_sl_orders(self, figi: str, direction: str, lots: int, result: OrderResult):
+        """Размещаем TP и SL ордера после открытия позиции"""
+        try:
+            settings = get_settings()
+            sl_pct = Decimal(settings.stop_loss_percent) / Decimal(100)
+            tp_pct = Decimal(settings.take_profit_percent) / Decimal(100)
+
+            async with AsyncClient(self.token) as api:
+                # Получаем информацию об инструменте для min_price_increment
+                instrument_resp = await api.instruments.get_instrument_by(id_type=1, id=figi)
+                if not instrument_resp or not instrument_resp.instrument:
+                    logger.error("Не удалось получить информацию об инструменте для TP/SL")
+                    return
+                
+                min_price_increment = self._quotation_to_decimal(instrument_resp.instrument.min_price_increment)
+                logger.info(f"Min price increment for {figi}: {min_price_increment}")
+
+                # Получаем текущую цену
+                last_prices = await api.market_data.get_last_prices(figi=[figi])
+                if not last_prices.last_prices:
+                    logger.error("Не удалось получить текущую цену для TP/SL")
+                    return
+
+                price_q = last_prices.last_prices[0].price
+                current_price = self._quotation_to_decimal(price_q)
+
+                # Рассчитываем цены SL/TP
+                if direction == "long":
+                    sl_price_raw = current_price * (Decimal(1) - sl_pct)
+                    tp_price_raw = current_price * (Decimal(1) + tp_pct)
+                    stop_direction = StopOrderDirection.STOP_ORDER_DIRECTION_SELL
+                else:  # short
+                    sl_price_raw = current_price * (Decimal(1) + sl_pct)
+                    tp_price_raw = current_price * (Decimal(1) - tp_pct)
+                    stop_direction = StopOrderDirection.STOP_ORDER_DIRECTION_BUY
+
+                # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: округляем цены до min_price_increment
+                def round_to_increment(price: Decimal, increment: Decimal) -> Decimal:
+                    if increment <= 0:
+                        return price.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                    # Округляем до ближайшего кратного increment
+                    rounded = (price / increment).quantize(Decimal("1"), rounding=ROUND_DOWN) * increment
+                    return rounded.quantize(increment, rounding=ROUND_DOWN)
+
+                sl_price = round_to_increment(sl_price_raw, min_price_increment)
+                tp_price = round_to_increment(tp_price_raw, min_price_increment)
+
+                logger.info(f"Calculated prices - SL: {sl_price}, TP: {tp_price} (increment: {min_price_increment})")
+
+                # Конвертируем цены в Quotation
+                def decimal_to_quotation(price: Decimal):
+                    units = int(price)
+                    nano = int((price - units) * Decimal("1000000000"))
+                    from tinkoff.invest import Quotation
+                    return Quotation(units=units, nano=nano)
+
+                sl_quotation = decimal_to_quotation(sl_price)
+                tp_quotation = decimal_to_quotation(tp_price)
+
+                # Размещаем стоп-лосс
+                try:
+                    sl_resp = await api.stop_orders.post_stop_order(
+                        figi=figi,
+                        quantity=lots,
+                        price=sl_quotation,
+                        stop_price=sl_quotation,
+                        direction=stop_direction,
+                        account_id=self.account_id,
+                        expiration_type=StopOrderExpirationType.STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL,
+                        stop_order_type=StopOrderType.STOP_ORDER_TYPE_STOP_LOSS
+                    )
+                    logger.info(f"SL order placed: {sl_resp.stop_order_id}")
+                    
+                    result.details["stop_loss_order_id"] = sl_resp.stop_order_id
+                    result.details["stop_loss_price"] = str(sl_price)
+                except Exception as e:
+                    logger.error(f"Failed to place SL order: {e}")
+
+                # Размещаем тейк-профит
+                try:
+                    tp_resp = await api.stop_orders.post_stop_order(
+                        figi=figi,
+                        quantity=lots,
+                        price=tp_quotation,
+                        stop_price=tp_quotation,
+                        direction=stop_direction,
+                        account_id=self.account_id,
+                        expiration_type=StopOrderExpirationType.STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL,
+                        stop_order_type=StopOrderType.STOP_ORDER_TYPE_TAKE_PROFIT
+                    )
+                    logger.info(f"TP order placed: {tp_resp.stop_order_id}")
+                    
+                    result.details["take_profit_order_id"] = tp_resp.stop_order_id
+                    result.details["take_profit_price"] = str(tp_price)
+                except Exception as e:
+                    logger.error(f"Failed to place TP order: {e}")
+
+        except Exception as e:
+            logger.error(f"Error placing TP/SL orders: {e}", exc_info=True)
 
     async def _get_instrument_info(self, figi: str) -> Optional[Dict[str, Any]]:
         try:
@@ -155,6 +265,9 @@ class OrderExecutor:
             return OrderResult(True, f"Позиция по {ticker} отсутствует, закрытие не требуется")
 
         try:
+            # Сначала отменяем все стоп-ордера по этому инструменту
+            await self._cancel_orders_for_figi(figi)
+
             if position.direction == "long":
                 result = await self._execute_sell_order(figi, position.lots, ticker, closing=True)
             else:
@@ -168,11 +281,44 @@ class OrderExecutor:
             logger.error(f"Error closing position: {e}")
             return OrderResult(False, f"Ошибка закрытия позиции {ticker}: {str(e)}")
 
+    async def _cancel_orders_for_figi(self, figi: str):
+        """Отменяем все ордера по конкретному FIGI"""
+        try:
+            async with AsyncClient(self.token) as client:
+                # Отменяем стоп-ордера
+                stop_orders = await client.stop_orders.get_stop_orders(account_id=self.account_id)
+                for stop_order in stop_orders.stop_orders:
+                    if stop_order.figi == figi:
+                        try:
+                            await client.stop_orders.cancel_stop_order(
+                                account_id=self.account_id,
+                                stop_order_id=stop_order.stop_order_id
+                            )
+                            logger.info(f"Cancelled stop order for {figi}: {stop_order.stop_order_id}")
+                        except Exception as e:
+                            logger.error(f"Error cancelling stop order {stop_order.stop_order_id}: {e}")
+
+                # Отменяем лимитные ордера
+                orders = await client.orders.get_orders(account_id=self.account_id)
+                for order in orders.orders:
+                    if order.figi == figi:
+                        try:
+                            await client.orders.cancel_order(
+                                account_id=self.account_id,
+                                order_id=order.order_id
+                            )
+                            logger.info(f"Cancelled limit order for {figi}: {order.order_id}")
+                        except Exception as e:
+                            logger.error(f"Error cancelling limit order {order.order_id}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error cancelling orders for {figi}: {e}")
+
     async def _execute_buy_order(self, figi: str, lots: int, ticker: str, closing: bool = False) -> OrderResult:
         try:
             async with AsyncClient(self.token) as client:
                 order_response = await client.orders.post_order(
-                    order_id="",  # Pass empty string to let API assign UUID
+                    order_id="",
                     figi=figi,
                     quantity=lots,
                     direction=OrderDirection.ORDER_DIRECTION_BUY,
@@ -197,7 +343,7 @@ class OrderExecutor:
         try:
             async with AsyncClient(self.token) as client:
                 order_response = await client.orders.post_order(
-                    order_id="",  # Pass empty string to let API assign UUID
+                    order_id="",
                     figi=figi,
                     quantity=lots,
                     direction=OrderDirection.ORDER_DIRECTION_SELL,
@@ -248,11 +394,9 @@ class OrderExecutor:
             return {"limit_orders": 0, "stop_orders": 0}
 
     def _quotation_to_decimal(self, quotation) -> Decimal:
-        # quotation имеет поля units (int64) и nano (int32)
+        """Конвертируем Quotation в Decimal"""
         return Decimal(str(quotation.units)) + Decimal(str(quotation.nano)) / Decimal("1000000000")
 
     def _fmt_money(self, x: Decimal) -> Decimal:
+        """Форматируем деньги с округлением до 2 знаков"""
         return x.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-
-    def _generate_order_id(self) -> str:
-        return ""  # оставляем пустым, чтобы API сам создал UUID
