@@ -68,6 +68,18 @@ services:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
 
+# Для подключения к дб и просмотра истории сделок поднимаем pgadmin - будет проксироваться наружу
+  pgadmin:
+    image: dpage/pgadmin4
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@mowertii.ru
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+
 volumes:
   redis_data:
   postgres_data:

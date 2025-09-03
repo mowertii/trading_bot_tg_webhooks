@@ -1,20 +1,42 @@
+-- db/init.sql
+-- Схема БД для сигналов, сделок и ошибок
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Входящие сигналы (webhooks)
+CREATE TABLE IF NOT EXISTS signals (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    action VARCHAR(50) NOT NULL,        -- buy/sell/close_all/balance
+    symbol VARCHAR(50),                  -- тикер/символ
+    risk_percent NUMERIC(6,3),
+    raw_payload JSONB,
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+);
+
+-- Исполненные сделки
 CREATE TABLE IF NOT EXISTS trades (
-    id SERIAL PRIMARY KEY,
-    figi VARCHAR(20) NOT NULL,
-    direction VARCHAR(4) NOT NULL,
-    quantity INTEGER NOT NULL,
-    price NUMERIC(12,4) NOT NULL,
-    executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    figi VARCHAR(64) NOT NULL,
+    ticker VARCHAR(50),
+    direction VARCHAR(10) NOT NULL,     -- long/short
+    lots INT NOT NULL,
+    amount NUMERIC(18,2),
+    price NUMERIC(18,6),
+    status VARCHAR(32),                  -- success / failed
+    details TEXT,
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS balance_history (
-    id SERIAL PRIMARY KEY,
-    account_id VARCHAR(20) NOT NULL,
-    balance NUMERIC(12,4) NOT NULL,
-    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+-- Ошибки
+CREATE TABLE IF NOT EXISTS errors (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    source VARCHAR(100),
+    message TEXT NOT NULL,
+    traceback TEXT,
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
 );
 
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO bot;
-
-CREATE INDEX idx_trades_figi ON trades(figi);
-CREATE INDEX idx_balance_account ON balance_history(account_id);
+-- Полезные индексы
+CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trades_created_at ON trades (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades (ticker);

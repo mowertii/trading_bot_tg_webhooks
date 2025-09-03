@@ -12,10 +12,10 @@ _LOCK = threading.RLock()
 
 class BotSettings(BaseModel):
     # Проценты указываются как человек видит: 40 означает 40%
-    risk_long_percent: float = Field(default=40.0, ge=0, le=100)
+    risk_long_percent: float = Field(default=30.0, ge=0, le=100)
     risk_short_percent: float = Field(default=30.0, ge=0, le=100)
     stop_loss_percent: float = Field(default=0.51, ge=0, le=100)
-    take_profit_percent: float = Field(default=9.0, ge=0, le=100)
+    take_profit_percent: float = Field(default=5.7, ge=0, le=100)
 
 
 class SettingsManager:
@@ -42,8 +42,14 @@ class SettingsManager:
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.path)
 
-    def get(self) -> BotSettings:
+    def get(self, reload: bool = True) -> BotSettings:
+        """
+        Возвращает текущие настройки.
+        Если reload=True — перечитывает JSON с диска (чтобы подхватывать онлайн-изменения).
+        """
         with _LOCK:
+            if reload:
+                self._settings = self._load_or_default()
             return self._settings
 
     def update(self, **kwargs) -> BotSettings:
@@ -57,8 +63,9 @@ class SettingsManager:
 _manager = SettingsManager(_SETTINGS_PATH)
 
 
-def get_settings() -> BotSettings:
-    return _manager.get()
+def get_settings(reload: bool = True) -> BotSettings:
+    """По умолчанию перечитываем JSON для онлайн-обновлений."""
+    return _manager.get(reload=reload)
 
 
 def update_settings(**kwargs) -> BotSettings:
