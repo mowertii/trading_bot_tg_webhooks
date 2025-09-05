@@ -36,6 +36,17 @@ CREATE TABLE IF NOT EXISTS errors (
     created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
 );
 
+-- События
+CREATE TABLE IF NOT EXISTS event_logs (
+  id SERIAL PRIMARY KEY,
+  event_time TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+  event_type TEXT NOT NULL,       -- e.g. 'signal', 'trade', 'error'
+  symbol TEXT,                    -- тикер инструмента
+  details JSONB,                  -- произвольные данные
+  message TEXT                    -- человекочитаемое описание
+);
+
+
 -- Полезные индексы
 CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_created_at ON trades (created_at DESC);

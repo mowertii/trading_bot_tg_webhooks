@@ -4,6 +4,7 @@ import json
 import logging
 import asyncpg
 from typing import Optional
+from config import DATABASE_URL
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,20 @@ async def log_trade(figi: str, ticker: Optional[str], direction: str, lots: int,
             )
     except Exception as e:
         logger.exception("Failed to log trade: %s", e)
+        
+async def log_event(event_type: str, symbol: str | None, details: dict, message: str):
+    """
+    Записывает запись в таблицу event_logs.
+    """
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute(
+        """
+        INSERT INTO event_logs(event_time, event_type, symbol, details, message)
+        VALUES($1, $2, $3, $4::jsonb, $5)
+        """,
+        datetime.utcnow(), event_type, symbol, json.dumps(details), message
+    )
+    await conn.close()
 
 async def log_error(source: str, message: str, traceback_text: Optional[str] = None):
     try:

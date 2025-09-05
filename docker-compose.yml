@@ -65,21 +65,25 @@ services:
       timeout: 5s
       retries: 10
     volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
 
 # Для подключения к дб и просмотра истории сделок поднимаем pgadmin - будет проксироваться наружу
   pgadmin:
     image: dpage/pgadmin4
-    restart: unless-stopped
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@mowertii.ru
-      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
     ports:
       - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
     depends_on:
       - db
+    restart: unless-stopped
 
 volumes:
   redis_data:
   postgres_data:
+  pgadmin_data:

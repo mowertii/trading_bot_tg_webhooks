@@ -1,4 +1,4 @@
-# app/bot/handlers/trade_handlers.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
+# app/bot/handlers/trade_handlers.py - ИСПРАВЛЕННАЯ ВЕРСИЯ с get_settings()
 from telegram import Update
 from telegram.ext import ContextTypes
 import os
@@ -7,10 +7,9 @@ import asyncio
 from decimal import Decimal
 from trading.tinkoff_client import TinkoffClient, Position 
 from trading.order_executor import OrderExecutor
-from trading.settings_manager import get_settings
+from trading.settings_manager import get_settings  # ✅ ИСПРАВЛЕНИЕ
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
 class TradeError(Exception):
     pass
@@ -41,9 +40,12 @@ async def _process_trade_command(update: Update, context: ContextTypes.DEFAULT_T
 
         positions = await client.get_positions_async()
         
+        # ✅ ИСПРАВЛЕНИЕ: используем настройки из get_settings()
+        settings = get_settings()
+        
         # Выполняем торговую логику и получаем детальный результат
         if action == 'buy':
-            risk_percent = Decimal(settings.risk_long_percent) / Decimal(100)
+            risk_percent = Decimal(settings.risk_long_percent) / Decimal(100)  # ✅ ИЗ НАСТРОЕК
             result = await _handle_trade_logic(
                 client=client,
                 executor=executor,
@@ -51,9 +53,10 @@ async def _process_trade_command(update: Update, context: ContextTypes.DEFAULT_T
                 instrument=instrument,
                 positions=positions,
                 direction='long',
-                risk_percent=risk_percent  # 40% от баланса для лонга
+                risk_percent=risk_percent
             )
         elif action == 'sell':
+            risk_percent = Decimal(settings.risk_short_percent) / Decimal(100)  # ✅ ИЗ НАСТРОЕК
             result = await _handle_trade_logic(
                 client=client,
                 executor=executor,
@@ -61,7 +64,7 @@ async def _process_trade_command(update: Update, context: ContextTypes.DEFAULT_T
                 instrument=instrument,
                 positions=positions,
                 direction='short',
-                risk_percent=Decimal('0.3')  # 30% от баланса для шорта
+                risk_percent=risk_percent
             )
         else:
             await message.reply_text(f"❌ Неподдерживаемое действие: {action}")
@@ -70,12 +73,12 @@ async def _process_trade_command(update: Update, context: ContextTypes.DEFAULT_T
         # Отправляем результат операции
         if result['success']:
             await message.reply_text(
-                f"✅ Операция {action.upper()} для {instrument} выполнена успешно!\n"
+                f"✅ Операция {action.upper()} для {instrument} выполнена успешно!\\n"
                 f"📊 Детали: {result['details']}"
             )
         else:
             await message.reply_text(
-                f"❌ Ошибка выполнения {action.upper()} для {instrument}:\n"
+                f"❌ Ошибка выполнения {action.upper()} для {instrument}:\\n"
                 f"🔍 Причина: {result['error']}"
             )
 
@@ -156,14 +159,14 @@ async def _handle_trade_logic(
             result_details.append(f"Статус: {main_result.message}")
             return {
                 'success': True,
-                'details': "\n".join(result_details),
+                'details': "\\n".join(result_details),
                 'error': ""
             }
         else:
             return {
                 'success': False,
                 'error': main_result.message,
-                'details': "\n".join(result_details)
+                'details': "\\n".join(result_details)
             }
 
     except Exception as e:

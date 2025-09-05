@@ -1,5 +1,4 @@
-# app/trading/order_executor.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
-
+# app/trading/order_executor.py - РАСШИРЕННАЯ ВЕРСИЯ с поддержкой кастомных TP/SL
 import logging
 import asyncio
 from decimal import Decimal, ROUND_DOWN
@@ -28,7 +27,6 @@ class OrderResult:
     executed_lots: Optional[int] = None
     details: Optional[Dict[str, Any]] = None
 
-
 class OrderExecutor:
     def __init__(self, token: str, account_id: str):
         self.token = token
@@ -42,12 +40,12 @@ class OrderExecutor:
         desired_direction: str,
         amount: Decimal,
         close_only: bool = False,
-        lots_override: int | None = None,  # НОВЫЙ ПАРАМЕТР
-        tp_percent: float | None = None,   # НОВЫЙ - для кастомного TP
-        sl_percent: float | None = None    # НОВЫЙ - для кастомного SL
+        lots_override: int | None = None,  # Поддержка фиксированного количества лотов
+        tp_percent: float | None = None,   # НОВЫЙ - кастомный TP
+        sl_percent: float | None = None    # НОВЫЙ - кастомный SL
     ) -> OrderResult:
         try:
-            logger.info(f"Executing smart order: {desired_direction} {figi}, amount={amount}, close_only={close_only}, lots_override={lots_override}")
+            logger.info(f"Executing smart order: {desired_direction} {figi}, amount={amount}, close_only={close_only}, lots_override={lots_override}, tp={tp_percent}, sl={sl_percent}")
 
             instrument_info = await self._get_instrument_info(figi)
             if not instrument_info:
@@ -60,7 +58,7 @@ class OrderExecutor:
             if close_only:
                 return await self._close_position(current_position, figi, ticker)
 
-            # ИЗМЕНЕНИЕ: используем lots_override если указан
+            # Используем lots_override если указан
             if lots_override is not None:
                 lots_to_trade = lots_override
                 logger.info(f"Using lots override: {lots_to_trade}")
@@ -97,7 +95,7 @@ class OrderExecutor:
                 }
                 result.message = f"{result.message} Торговано: {lots_to_trade} лот(ов)"
 
-                # Выставляем SL и TP после успешного открытия позиции
+                # Выставляем SL и TP после успешного открытия позиции с кастомными значениями
                 if not close_only:
                     await self._place_tp_sl_orders(figi, desired_direction, lots_to_trade, result, tp_percent, sl_percent)
 
@@ -108,11 +106,11 @@ class OrderExecutor:
             return OrderResult(False, f"Системная ошибка при выполнении ордера: {str(e)}")
 
     async def _place_tp_sl_orders(self, figi: str, direction: str, lots: int, result: OrderResult, tp_percent: float = None, sl_percent: float = None):
-        """Размещаем TP и SL ордера после открытия позиции"""
+        """Размещаем TP и SL ордера после открытия позиции с поддержкой кастомных значений"""
         try:
             settings = get_settings()
             
-            # ИСПРАВЛЕНИЕ: используем переданные значения или из настроек
+            # НОВОЕ: используем переданные значения или из настроек
             if tp_percent is not None:
                 tp_pct = Decimal(tp_percent) / Decimal(100)
             else:
@@ -122,6 +120,8 @@ class OrderExecutor:
                 sl_pct = Decimal(sl_percent) / Decimal(100)
             else:
                 sl_pct = Decimal(settings.stop_loss_percent) / Decimal(100)
+
+            logger.info(f"Using TP: {tp_pct*100:.2f}%, SL: {sl_pct*100:.2f}%")
 
             async with AsyncClient(self.token) as api:
                 # Получаем информацию об инструменте для min_price_increment
@@ -152,11 +152,10 @@ class OrderExecutor:
                     tp_price_raw = current_price * (Decimal(1) - tp_pct)
                     stop_direction = StopOrderDirection.STOP_ORDER_DIRECTION_BUY
 
-                # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: округляем цены до min_price_increment
+                # Округляем цены до min_price_increment
                 def round_to_increment(price: Decimal, increment: Decimal) -> Decimal:
                     if increment <= 0:
                         return price.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                    # Округляем до ближайшего кратного increment
                     rounded = (price / increment).quantize(Decimal("1"), rounding=ROUND_DOWN) * increment
                     return rounded.quantize(increment, rounding=ROUND_DOWN)
 
@@ -240,8 +239,6 @@ class OrderExecutor:
 
                 current_price: Optional[Decimal] = None
 
-                # bids/asks могут быть списками записей, у каждой есть поле price (Quotation)
-                # Берем среднюю между лучшим бидом и аском, если есть
                 try:
                     has_bid = bool(ob.bids)
                     has_ask = bool(ob.asks)
@@ -358,9 +355,7 @@ class OrderExecutor:
             return OrderResult(False, f"Системная ошибка при покупке {ticker}: {str(e)}")
 
     async def _check_margin_requirements(self, figi: str, direction: str, lots: int) -> tuple[bool, str]:
-        """
-        Проверяет маржинальные требования перед размещением ордера
-        """
+        """Проверяет маржинальные требования перед размещением ордера"""
         try:
             async with AsyncClient(self.token) as client:
                 # Проверяем торговый статус инструмента
@@ -404,7 +399,7 @@ class OrderExecutor:
 
     async def _execute_sell_order(self, figi: str, lots: int, ticker: str, closing: bool = False) -> OrderResult:
         try:
-            # НОВОЕ: проверяем маржинальные требования для шорт-позиций
+            # Проверяем маржинальные требования для шорт-позиций
             if not closing:
                 margin_ok, margin_msg = await self._check_margin_requirements(figi, "short", lots)
                 if not margin_ok:

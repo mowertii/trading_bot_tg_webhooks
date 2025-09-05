@@ -1,4 +1,4 @@
-# app/trading/settings_manager.py
+# app/trading/settings_manager.py - РАСШИРЕННАЯ ВЕРСИЯ
 from __future__ import annotations
 from pydantic import BaseModel, Field
 from pathlib import Path
@@ -9,14 +9,18 @@ import threading
 _SETTINGS_PATH = Path(__file__).resolve().parents[1] / "db" / "bot_settings.json"
 _LOCK = threading.RLock()
 
-
 class BotSettings(BaseModel):
     # Проценты указываются как человек видит: 40 означает 40%
     risk_long_percent: float = Field(default=30.0, ge=0, le=100)
     risk_short_percent: float = Field(default=30.0, ge=0, le=100)
     stop_loss_percent: float = Field(default=0.51, ge=0, le=100)
     take_profit_percent: float = Field(default=5.7, ge=0, le=100)
-
+    
+    # НОВЫЕ ПОЛЯ для авто-ликвидации
+    auto_liquidation_enabled: bool = True
+    auto_liquidation_time: str = "21:44"  # Время в формате HH:MM по МСК
+    auto_liquidation_block_minutes: int = 30  # Окно блокировки вебхуков в минутах
+    auto_liquidation_days: list[int] = [0, 1, 2, 3, 4]  # 0=Пн, 1=Вт ... 6=Вс (будни по умолчанию)
 
 class SettingsManager:
     def __init__(self, path: Path):
@@ -42,7 +46,7 @@ class SettingsManager:
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.path)
 
-    def get(self, reload: bool = True) -> BotSettings:
+    def get(self, reload: bool = False) -> BotSettings:
         """
         Возвращает текущие настройки.
         Если reload=True — перечитывает JSON с диска (чтобы подхватывать онлайн-изменения).
@@ -59,14 +63,11 @@ class SettingsManager:
             self._settings = updated
             return updated
 
-
 _manager = SettingsManager(_SETTINGS_PATH)
 
-
 def get_settings(reload: bool = True) -> BotSettings:
-    """По умолчанию перечитываем JSON для онлайн-обновлений."""
+    """⚡ По умолчанию всегда перечитываем JSON"""
     return _manager.get(reload=reload)
-
 
 def update_settings(**kwargs) -> BotSettings:
     return _manager.update(**kwargs)

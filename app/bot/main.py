@@ -3,7 +3,7 @@ import os
 import re
 import asyncio
 import logging
-
+from bot.handlers.settings_handler import handle_settings_command, handle_set
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -119,7 +119,8 @@ def main():
     application = ApplicationBuilder().token(token).build()
     setup_handlers(application)
     application.add_error_handler(error_handler)
-
+    application.add_handler(MessageHandler(filters.Regex(r'^settings$'), handle_settings_command))
+    application.add_handler(MessageHandler(filters.Regex(r'^set\s+'), handle_set))
     executor = OrderExecutor(tinkoff_token, account_id)
     watcher = OrderWatcher(
         tinkoff_token,
