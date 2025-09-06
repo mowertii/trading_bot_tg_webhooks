@@ -5,11 +5,12 @@ import logging
 import asyncpg
 from typing import Optional
 from config import DATABASE_URL
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 # Ожидаем переменную окружения DB_URL вида: postgresql://user:pass@db:5432/trading_data
-DB_URL = os.getenv("DB_URL")
+DB_URL = os.getenv("DB_URL", "postgresql://bot:11111111@db:5432/trading_data")
 
 _pool: Optional[asyncpg.pool.Pool] = None
 

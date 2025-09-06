@@ -8,6 +8,7 @@
 - `/set_stop 1.2` → изменить стоп-лосс на 1.2%  
 - `/set_tp 8` → изменить тейк-профит на 8%  
 - `/show_settings` → показать текущие параметры  
+- `/help` → показать доступные функции 
 
 ## Базовая информация
 
@@ -244,3 +245,21 @@ docker-compose logs --tail 100 webhook-bot
 ### Метрики
 - Health check: `GET /health`
 - Проверка доступности: `curl https://webhook.mowertii.ru/health`
+
+# Настройка вебхук алертов
+
+```для LONG```
+{
+  "action": "buy", 
+  "symbol": "IBU5",
+  "quantity": 5,
+  "sl_percent": 0.35
+}
+```для SHORT``` 
+{
+  "action": "sell", 
+  "symbol": "IBU5",
+  "quantity": 5,
+  "sl_percent": 0.35
+}
+

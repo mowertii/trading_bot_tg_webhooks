@@ -1,4 +1,5 @@
-# app/trading/order_executor.py - РАСШИРЕННАЯ ВЕРСИЯ с поддержкой кастомных TP/SL
+# app/trading/order_executor.py - ПОЛНАЯ ВЕРСИЯ с исправленным логированием
+
 import logging
 import asyncio
 from decimal import Decimal, ROUND_DOWN
@@ -15,6 +16,7 @@ from tinkoff.invest import (
 )
 from .tinkoff_client import TinkoffClient
 from trading.settings_manager import get_settings
+from trading.db_logger import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +42,13 @@ class OrderExecutor:
         desired_direction: str,
         amount: Decimal,
         close_only: bool = False,
-        lots_override: int | None = None,  # Поддержка фиксированного количества лотов
-        tp_percent: float | None = None,   # НОВЫЙ - кастомный TP
-        sl_percent: float | None = None    # НОВЫЙ - кастомный SL
+        lots_override: int | None = None,
+        tp_percent: float | None = None,
+        sl_percent: float | None = None
     ) -> OrderResult:
+        ticker = "UNKNOWN"  # Инициализируем тикер для логирования
         try:
-            logger.info(f"Executing smart order: {desired_direction} {figi}, amount={amount}, close_only={close_only}, lots_override={lots_override}, tp={tp_percent}, sl={sl_percent}")
+            logger.info(f"Executing smart order: {desired_direction} {figi}, amount={amount}, close_only={close_only}, lots_override={lots_override}")
 
             instrument_info = await self._get_instrument_info(figi)
             if not instrument_info:
@@ -95,44 +98,62 @@ class OrderExecutor:
                 }
                 result.message = f"{result.message} Торговано: {lots_to_trade} лот(ов)"
 
-                # Выставляем SL и TP после успешного открытия позиции с кастомными значениями
+                # Логируем успешную торговлю
+                await log_event(
+                    event_type="trade",
+                    symbol=ticker,
+                    details=result.details or {},
+                    message=f"{desired_direction.upper()} {ticker}: {lots_to_trade} лот(ов)"
+                )
+
+                # Выставляем SL и мульти-TP после успешного открытия позиции
                 if not close_only:
-                    await self._place_tp_sl_orders(figi, desired_direction, lots_to_trade, result, tp_percent, sl_percent)
+                    await self._place_multi_tp_sl_orders(figi, desired_direction, lots_to_trade, result, tp_percent, sl_percent, ticker)
+            else:
+                # Логируем ошибку при торговле
+                await log_event(
+                    event_type="error",
+                    symbol=ticker,
+                    details={},
+                    message=f"Error {desired_direction.upper()} {ticker}: {result.message}"
+                )
 
             return result
 
         except Exception as e:
             logger.error(f"Error in execute_smart_order: {e}", exc_info=True)
+            # Логируем критическую ошибку
+            try:
+                await log_event(
+                    event_type="error",
+                    symbol=ticker,
+                    details={"exception": str(e)},
+                    message=f"Critical error in execute_smart_order {ticker}: {str(e)}"
+                )
+            except Exception:
+                pass  # Не падаем если логирование не работает
             return OrderResult(False, f"Системная ошибка при выполнении ордера: {str(e)}")
 
-    async def _place_tp_sl_orders(self, figi: str, direction: str, lots: int, result: OrderResult, tp_percent: float = None, sl_percent: float = None):
-        """Размещаем TP и SL ордера после открытия позиции с поддержкой кастомных значений"""
+    async def _place_multi_tp_sl_orders(self, figi: str, direction: str, lots: int, result: OrderResult, tp_percent: float = None, sl_percent: float = None, ticker: str = "UNKNOWN"):
+        """Размещаем SL и МУЛЬТИ-TP ордера после открытия позиции"""
         try:
             settings = get_settings()
             
-            # НОВОЕ: используем переданные значения или из настроек
-            if tp_percent is not None:
-                tp_pct = Decimal(tp_percent) / Decimal(100)
-            else:
-                tp_pct = Decimal(settings.take_profit_percent) / Decimal(100)
-                
+            # SL процент
             if sl_percent is not None:
                 sl_pct = Decimal(sl_percent) / Decimal(100)
             else:
                 sl_pct = Decimal(settings.stop_loss_percent) / Decimal(100)
 
-            logger.info(f"Using TP: {tp_pct*100:.2f}%, SL: {sl_pct*100:.2f}%")
-
             async with AsyncClient(self.token) as api:
-                # Получаем информацию об инструменте для min_price_increment
+                # Получаем информацию об инструменте
                 instrument_resp = await api.instruments.get_instrument_by(id_type=1, id=figi)
                 if not instrument_resp or not instrument_resp.instrument:
                     logger.error("Не удалось получить информацию об инструменте для TP/SL")
                     return
 
                 min_price_increment = self._quotation_to_decimal(instrument_resp.instrument.min_price_increment)
-                logger.info(f"Min price increment for {figi}: {min_price_increment}")
-
+                
                 # Получаем текущую цену
                 last_prices = await api.market_data.get_last_prices(figi=[figi])
                 if not last_prices.last_prices:
@@ -142,43 +163,21 @@ class OrderExecutor:
                 price_q = last_prices.last_prices[0].price
                 current_price = self._quotation_to_decimal(price_q)
 
-                # Рассчитываем цены SL/TP
+                # Определяем направление стоп-ордеров
                 if direction == "long":
-                    sl_price_raw = current_price * (Decimal(1) - sl_pct)
-                    tp_price_raw = current_price * (Decimal(1) + tp_pct)
                     stop_direction = StopOrderDirection.STOP_ORDER_DIRECTION_SELL
-                else:  # short
-                    sl_price_raw = current_price * (Decimal(1) + sl_pct)
-                    tp_price_raw = current_price * (Decimal(1) - tp_pct)
+                else:
                     stop_direction = StopOrderDirection.STOP_ORDER_DIRECTION_BUY
 
-                # Округляем цены до min_price_increment
-                def round_to_increment(price: Decimal, increment: Decimal) -> Decimal:
-                    if increment <= 0:
-                        return price.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                    rounded = (price / increment).quantize(Decimal("1"), rounding=ROUND_DOWN) * increment
-                    return rounded.quantize(increment, rounding=ROUND_DOWN)
-
-                sl_price = round_to_increment(sl_price_raw, min_price_increment)
-                tp_price = round_to_increment(tp_price_raw, min_price_increment)
-
-                logger.info(f"Calculated prices - SL: {sl_price}, TP: {tp_price} (increment: {min_price_increment})")
-
-                # Конвертируем цены в Quotation
-                def decimal_to_quotation(price: Decimal):
-                    units = int(price)
-                    nano = int((price - units) * Decimal("1000000000"))
-                    from tinkoff.invest import Quotation
-                    return Quotation(units=units, nano=nano)
-
-                sl_quotation = decimal_to_quotation(sl_price)
-                tp_quotation = decimal_to_quotation(tp_price)
-
-                # Размещаем стоп-лосс
+                # 1. РАЗМЕЩАЕМ SL на всю позицию
                 try:
+                    sl_price_raw = current_price * (Decimal(1) - sl_pct) if direction == "long" else current_price * (Decimal(1) + sl_pct)
+                    sl_price = self._round_to_increment(sl_price_raw, min_price_increment)
+                    sl_quotation = self._decimal_to_quotation(sl_price)
+
                     sl_resp = await api.stop_orders.post_stop_order(
                         figi=figi,
-                        quantity=lots,
+                        quantity=lots,  # SL на всю позицию
                         price=sl_quotation,
                         stop_price=sl_quotation,
                         direction=stop_direction,
@@ -186,34 +185,127 @@ class OrderExecutor:
                         expiration_type=StopOrderExpirationType.STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL,
                         stop_order_type=StopOrderType.STOP_ORDER_TYPE_STOP_LOSS
                     )
-                    logger.info(f"SL order placed: {sl_resp.stop_order_id}")
-                    
+                    logger.info(f"SL order placed: {sl_resp.stop_order_id} at {sl_price}")
                     result.details["stop_loss_order_id"] = sl_resp.stop_order_id
                     result.details["stop_loss_price"] = str(sl_price)
+
+                    # Логируем успешное размещение SL
+                    await log_event(
+                        event_type="sl_order",
+                        symbol=ticker,
+                        details={
+                            "order_id": sl_resp.stop_order_id,
+                            "price": str(sl_price),
+                            "lots": lots
+                        },
+                        message=f"SL {ticker} {sl_price} ({lots} лотов)"
+                    )
                 except Exception as e:
                     logger.error(f"Failed to place SL order: {e}")
-
-                # Размещаем тейк-профит
-                try:
-                    tp_resp = await api.stop_orders.post_stop_order(
-                        figi=figi,
-                        quantity=lots,
-                        price=tp_quotation,
-                        stop_price=tp_quotation,
-                        direction=stop_direction,
-                        account_id=self.account_id,
-                        expiration_type=StopOrderExpirationType.STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL,
-                        stop_order_type=StopOrderType.STOP_ORDER_TYPE_TAKE_PROFIT
+                    await log_event(
+                        event_type="error",
+                        symbol=ticker,
+                        details={},
+                        message=f"Failed SL {ticker}: {str(e)}"
                     )
-                    logger.info(f"TP order placed: {tp_resp.stop_order_id}")
+
+                # 2. РАЗМЕЩАЕМ МУЛЬТИ-TP
+                if tp_percent is not None:
+                    # Если передан кастомный TP - используем его как единый
+                    tp_pct = Decimal(tp_percent) / Decimal(100)
+                    tp_price_raw = current_price * (Decimal(1) + tp_pct) if direction == "long" else current_price * (Decimal(1) - tp_pct)
+                    tp_price = self._round_to_increment(tp_price_raw, min_price_increment)
                     
-                    result.details["take_profit_order_id"] = tp_resp.stop_order_id
-                    result.details["take_profit_price"] = str(tp_price)
-                except Exception as e:
-                    logger.error(f"Failed to place TP order: {e}")
+                    await self._place_single_tp(api, figi, lots, tp_price, stop_direction, result, "custom", ticker)
+                else:
+                    # Используем мульти-TP из настроек
+                    tp_distribution = settings.get_tp_distribution(lots)
+                    logger.info(f"Multi-TP distribution for {lots} lots: {tp_distribution}")
+                    
+                    placed_tps = []
+                    for i, (tp_percent_setting, tp_lots) in enumerate(tp_distribution):
+                        if tp_lots <= 0:
+                            continue
+                            
+                        tp_pct = Decimal(tp_percent_setting) / Decimal(100)
+                        tp_price_raw = current_price * (Decimal(1) + tp_pct) if direction == "long" else current_price * (Decimal(1) - tp_pct)
+                        tp_price = self._round_to_increment(tp_price_raw, min_price_increment)
+                        
+                        tp_order_id = await self._place_single_tp(api, figi, tp_lots, tp_price, stop_direction, result, f"tp_{i+1}", ticker)
+                        if tp_order_id:
+                            placed_tps.append({
+                                "level": i+1,
+                                "percent": tp_percent_setting,
+                                "lots": tp_lots,
+                                "price": str(tp_price),
+                                "order_id": tp_order_id
+                            })
+                    
+                    result.details["multi_tp_orders"] = placed_tps
+                    logger.info(f"Placed {len(placed_tps)} TP orders: {[tp['order_id'] for tp in placed_tps]}")
 
         except Exception as e:
-            logger.error(f"Error placing TP/SL orders: {e}", exc_info=True)
+            logger.error(f"Error placing multi TP/SL orders: {e}", exc_info=True)
+            await log_event(
+                event_type="error",
+                symbol=ticker,
+                details={},
+                message=f"Error placing TP/SL orders for {ticker}: {str(e)}"
+            )
+
+    async def _place_single_tp(self, api, figi: str, lots: int, price: Decimal, direction, result: OrderResult, level_name: str, ticker: str) -> str:
+        """Размещает один TP ордер"""
+        try:
+            tp_quotation = self._decimal_to_quotation(price)
+            tp_resp = await api.stop_orders.post_stop_order(
+                figi=figi,
+                quantity=lots,
+                price=tp_quotation,
+                stop_price=tp_quotation,
+                direction=direction,
+                account_id=self.account_id,
+                expiration_type=StopOrderExpirationType.STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL,
+                stop_order_type=StopOrderType.STOP_ORDER_TYPE_TAKE_PROFIT
+            )
+            logger.info(f"TP {level_name} order placed: {tp_resp.stop_order_id} for {lots} lots at {price}")
+
+            # Логируем успешное размещение TP
+            await log_event(
+                event_type="tp_order",
+                symbol=ticker,
+                details={
+                    "level": level_name,
+                    "order_id": tp_resp.stop_order_id,
+                    "price": str(price),
+                    "lots": lots
+                },
+                message=f"TP{level_name.upper()} {ticker} {price} ({lots} лотов)"
+            )
+
+            return tp_resp.stop_order_id
+        except Exception as e:
+            logger.error(f"Failed to place TP {level_name} order: {e}")
+            await log_event(
+                event_type="error",
+                symbol=ticker,
+                details={},
+                message=f"Failed TP{level_name.upper()} {ticker}: {str(e)}"
+            )
+            return None
+
+    def _round_to_increment(self, price: Decimal, increment: Decimal) -> Decimal:
+        """Округляет цену до минимального шага"""
+        if increment <= 0:
+            return price.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        rounded = (price / increment).quantize(Decimal("1"), rounding=ROUND_DOWN) * increment
+        return rounded.quantize(increment, rounding=ROUND_DOWN)
+
+    def _decimal_to_quotation(self, price: Decimal):
+        """Конвертирует Decimal в Quotation"""
+        units = int(price)
+        nano = int((price - units) * Decimal("1000000000"))
+        from tinkoff.invest import Quotation
+        return Quotation(units=units, nano=nano)
 
     async def _get_instrument_info(self, figi: str) -> Optional[Dict[str, Any]]:
         try:
@@ -232,11 +324,9 @@ class OrderExecutor:
             return None
 
     async def _calculate_lots(self, figi: str, amount: Decimal, instrument_info: Dict) -> int:
-        """Рассчитываем количество лотов; безопасный парсинг стакана с фоллбэком на last_price."""
         try:
             async with AsyncClient(self.token) as client:
                 ob = await client.market_data.get_order_book(figi=figi, depth=1)
-
                 current_price: Optional[Decimal] = None
 
                 try:
@@ -280,7 +370,6 @@ class OrderExecutor:
             return OrderResult(True, f"Позиция по {ticker} отсутствует, закрытие не требуется")
 
         try:
-            # Сначала отменяем все стоп-ордера по этому инструменту
             await self._cancel_orders_for_figi(figi)
 
             if position.direction == "long":
@@ -290,6 +379,13 @@ class OrderExecutor:
 
             if result.success:
                 result.message = f"Закрыта {position.direction} позиция по {ticker}: {position.lots} лот(ов)"
+                # Логируем закрытие позиции
+                await log_event(
+                    event_type="position_close",
+                    symbol=ticker,
+                    details={"direction": position.direction, "lots": position.lots},
+                    message=f"Closed {position.direction} position {ticker}: {position.lots} lots"
+                )
             return result
 
         except Exception as e:
@@ -297,7 +393,6 @@ class OrderExecutor:
             return OrderResult(False, f"Ошибка закрытия позиции {ticker}: {str(e)}")
 
     async def _cancel_orders_for_figi(self, figi: str):
-        """Отменяем все ордера по конкретному FIGI"""
         try:
             async with AsyncClient(self.token) as client:
                 # Отменяем стоп-ордера
@@ -355,33 +450,25 @@ class OrderExecutor:
             return OrderResult(False, f"Системная ошибка при покупке {ticker}: {str(e)}")
 
     async def _check_margin_requirements(self, figi: str, direction: str, lots: int) -> tuple[bool, str]:
-        """Проверяет маржинальные требования перед размещением ордера"""
         try:
             async with AsyncClient(self.token) as client:
-                # Проверяем торговый статус инструмента
                 trading_status = await client.market_data.get_trading_status(figi=figi)
 
                 if not trading_status.api_trade_available_flag:
                     return False, "Торговля через API недоступна для данного инструмента"
 
-                # Для шорт-позиций проверяем доступность маржинальной торговли
                 if direction == "short":
                     try:
-                        # Получаем маржинальные атрибуты счета
                         margin_attrs = await client.users.get_margin_attributes(account_id=self.account_id)
-
-                        # Проверяем что маржинальная торговля включена
                         if not margin_attrs:
                             return False, "Маржинальная торговля отключена для данного счета"
 
-                        # Получаем информацию об инструменте
                         instrument_resp = await client.instruments.get_instrument_by(id_type=1, id=figi)
                         if not instrument_resp or not instrument_resp.instrument:
                             return False, "Не удалось получить информацию об инструменте"
 
                         ticker = instrument_resp.instrument.ticker
 
-                        # Проверяем что инструмент доступен для шорта
                         if not getattr(instrument_resp.instrument, 'short_enabled_flag', False):
                             return False, f"Инструмент {ticker} недоступен для продажи в шорт"
 
@@ -399,7 +486,6 @@ class OrderExecutor:
 
     async def _execute_sell_order(self, figi: str, lots: int, ticker: str, closing: bool = False) -> OrderResult:
         try:
-            # Проверяем маржинальные требования для шорт-позиций
             if not closing:
                 margin_ok, margin_msg = await self._check_margin_requirements(figi, "short", lots)
                 if not margin_ok:
@@ -461,9 +547,7 @@ class OrderExecutor:
             return {"limit_orders": 0, "stop_orders": 0}
 
     def _quotation_to_decimal(self, quotation) -> Decimal:
-        """Конвертируем Quotation в Decimal"""
         return Decimal(str(quotation.units)) + Decimal(str(quotation.nano)) / Decimal("1000000000")
 
     def _fmt_money(self, x: Decimal) -> Decimal:
-        """Форматируем деньги с округлением до 2 знаков"""
         return x.quantize(Decimal("0.01"), rounding=ROUND_DOWN)

@@ -1,0 +1,14 @@
+# db/bot_settings.json - ОБНОВЛЕННЫЙ файл настроек с мульти-TP
+{
+  "risk_long_percent": 30.0,
+  "risk_short_percent": 30.0,
+  "stop_loss_percent": 0.51,
+  "take_profit_percent": 5.7,
+  "use_multi_tp": true,
+  "tp_levels": [0.5, 1.0, 1.6],
+  "tp_portions": [0.33, 0.33, 0.34],
+  "auto_liquidation_enabled": true,
+  "auto_liquidation_time": "21:44",
+  "auto_liquidation_block_minutes": 30,
+  "auto_liquidation_days": [0, 1, 2, 3, 4]
+}

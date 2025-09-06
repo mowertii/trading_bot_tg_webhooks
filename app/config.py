@@ -10,3 +10,5 @@ class Config:
     ACCOUNT_ID = os.getenv("ACCOUNT_ID")
     LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG")    
     DATABASE_URL = os.getenv("DB_URL")
+    
+DATABASE_URL = Config.DATABASE_URL

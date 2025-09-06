@@ -1,4 +1,4 @@
-# app/bot/handlers/settings_handler.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
+# app/bot/handlers/settings_handler.py - ВЕРСИЯ с мульти-TP настройками
 from telegram import Update
 from telegram.ext import ContextTypes
 import logging
@@ -17,6 +17,10 @@ HELP_TEXT = (
     "• Только шорт: `set risk short 25`\n"
     "• Стоп-лосс: `set sl 0.7` (в %)\n"
     "• Тейк-профит: `set tp 9` (в %)\n\n"
+    "*Мульти-TP:*\n"
+    "• Включить/выключить: `set multi on/off`\n"
+    "• Уровни TP: `set tp levels 0.5,1.0,1.6`\n"
+    "• Доли позиций: `set tp portions 33,33,34`\n\n"
     "*Авто-ликвидация:*\n"
     "• Включить/выключить: `set auto on/off`\n"
     "• Время: `set auto time 21:30`\n"
@@ -30,13 +34,22 @@ def _fmt_settings():
     days_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     active_days = ", ".join([days_names[d] for d in s.auto_liquidation_days])
     
+    # Форматируем мульти-TP информацию
+    multi_tp_status = "✅ Включен" if s.use_multi_tp else "❌ Выключен"
+    tp_levels_str = ", ".join([f"{tp:.1f}%" for tp in s.tp_levels])
+    tp_portions_str = ", ".join([f"{int(p*100)}%" for p in s.tp_portions])
+    
     return (
         f"🔧 *Текущие настройки:*\n\n"
         f"*Торговля:*\n"
         f"• Risk LONG: `{s.risk_long_percent:.1f}%`\n"
         f"• Risk SHORT: `{s.risk_short_percent:.1f}%`\n"
         f"• Stop-Loss: `{s.stop_loss_percent:.2f}%`\n"
-        f"• Take-Profit: `{s.take_profit_percent:.1f}%`\n\n"
+        f"• Take-Profit: `{s.take_profit_percent:.1f}%` (базовый)\n\n"
+        f"*Мульти-TP:*\n"
+        f"• Статус: {multi_tp_status}\n"
+        f"• Уровни: `{tp_levels_str}`\n"
+        f"• Доли: `{tp_portions_str}`\n\n"
         f"*Авто-ликвидация:*\n"
         f"• Статус: {'✅ Включена' if s.auto_liquidation_enabled else '❌ Выключена'}\n"
         f"• Время: `{s.auto_liquidation_time}` МСК\n"
@@ -105,6 +118,68 @@ async def handle_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("✅ Обновлено:\n" + _fmt_settings(), parse_mode='Markdown')
             return
 
+        # НОВЫЕ КОМАНДЫ для мульти-TP
+        
+        # set multi on/off
+        m = re.match(r'^set\s+multi\s+(on|off|true|false|1|0)$', text, re.IGNORECASE)
+        if m:
+            enabled = m.group(1).lower() in ['on', 'true', '1']
+            update_settings(use_multi_tp=enabled)
+            status = "включен" if enabled else "выключен"
+            await message.reply_text(f"✅ Мульти-TP {status}\n\n" + _fmt_settings(), parse_mode='Markdown')
+            return
+
+        # set tp levels 0.5,1.0,1.6
+        m = re.match(r'^set\s+tp\s+levels\s+([\d\.,\s]+)$', text, re.IGNORECASE)
+        if m:
+            try:
+                levels_str = m.group(1).replace(" ", "")
+                levels = [float(l) for l in levels_str.split(",") if l.strip()]
+                if len(levels) > 0 and all(0 <= l <= 100 for l in levels):
+                    # Автоматически подстраиваем доли под количество уровней
+                    count = len(levels)
+                    base_portion = 1.0 / count
+                    portions = [base_portion] * (count - 1) + [1.0 - base_portion * (count - 1)]
+                    
+                    update_settings(tp_levels=levels, tp_portions=portions)
+                    await message.reply_text(f"✅ Уровни TP обновлены: {levels}\nДоли автоматически распределены\n\n" + _fmt_settings(), parse_mode='Markdown')
+                    return
+                else:
+                    await message.reply_text("❌ Уровни TP должны быть в диапазоне 0-100%")
+                    return
+            except ValueError:
+                await message.reply_text("❌ Неверный формат. Используйте: `set tp levels 0.5,1.0,1.6`")
+                return
+
+        # set tp portions 33,33,34
+        m = re.match(r'^set\s+tp\s+portions\s+([\d,\s]+)$', text, re.IGNORECASE)
+        if m:
+            try:
+                portions_str = m.group(1).replace(" ", "")
+                portions_pct = [int(p) for p in portions_str.split(",") if p.strip()]
+                
+                if len(portions_pct) > 0 and sum(portions_pct) == 100:
+                    portions = [p / 100.0 for p in portions_pct]
+                    # Подстраиваем количество уровней под количество долей
+                    s = get_settings()
+                    if len(portions) != len(s.tp_levels):
+                        # Создаем равномерные уровни
+                        levels = [0.5 + i * 0.5 for i in range(len(portions))]
+                        update_settings(tp_levels=levels, tp_portions=portions)
+                        await message.reply_text(f"✅ Доли TP обновлены: {portions_pct}%\nУровни автоматически подстроены\n\n" + _fmt_settings(), parse_mode='Markdown')
+                    else:
+                        update_settings(tp_portions=portions)
+                        await message.reply_text(f"✅ Доли TP обновлены: {portions_pct}%\n\n" + _fmt_settings(), parse_mode='Markdown')
+                    return
+                else:
+                    await message.reply_text("❌ Доли должны быть положительными и в сумме равны 100%")
+                    return
+            except ValueError:
+                await message.reply_text("❌ Неверный формат. Используйте: `set tp portions 33,33,34`")
+                return
+
+        # КОМАНДЫ для авто-ликвидации (без изменений)
+        
         # set auto on/off
         m = re.match(r'^set\s+auto\s+(on|off|true|false|1|0)$', text, re.IGNORECASE)
         if m:
@@ -132,7 +207,7 @@ async def handle_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m = re.match(r'^set\s+auto\s+block\s+(\d+)$', text, re.IGNORECASE)
         if m:
             minutes = int(m.group(1))
-            if 1 <= minutes <= 180:  # От 1 до 3 часов
+            if 1 <= minutes <= 180:
                 update_settings(auto_liquidation_block_minutes=minutes)
                 await message.reply_text(f"✅ Окно блокировки изменено на {minutes} минут\n\n" + _fmt_settings(), parse_mode='Markdown')
                 return
@@ -146,9 +221,9 @@ async def handle_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 days_str = m.group(1).replace(" ", "")
                 days = [int(d) for d in days_str.split(",") if d.strip()]
-                days = [d for d in days if 0 <= d <= 6]  # Фильтруем только валидные дни
+                days = [d for d in days if 0 <= d <= 6]
                 if days:
-                    days = sorted(list(set(days)))  # Убираем дубли и сортируем
+                    days = sorted(list(set(days)))
                     update_settings(auto_liquidation_days=days)
                     days_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
                     active_days = ", ".join([days_names[d] for d in days])
