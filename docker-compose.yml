@@ -10,6 +10,7 @@ services:
       - "8080:8080"
     env_file: .env
     environment:
+      - DB_URL=${DB_URL}
       - BOT_TOKEN=${BOT_TOKEN}
       - TARGET_USER_ID=${TARGET_USER_ID}
       - TINKOFF_TOKEN=${TINKOFF_TOKEN}
@@ -35,6 +36,7 @@ services:
     command: python -m bot.main
     env_file: .env
     environment:
+      - DB_URL=${DB_URL}
       - BOT_TOKEN=${BOT_TOKEN}
       - TARGET_USER_ID=${TARGET_USER_ID}
       - TINKOFF_TOKEN=${TINKOFF_TOKEN}

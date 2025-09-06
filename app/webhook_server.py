@@ -1,4 +1,4 @@
-# app/webhook_server.py - ИСПРАВЛЕННАЯ ВЕРСИЯ с правильной инициализацией планировщика
+# app/webhook_server.py - ИСПРАВЛЕННАЯ ВЕРСИЯ с логированием
 import os
 import json
 import hmac
@@ -16,6 +16,7 @@ from apscheduler.triggers.cron import CronTrigger
 from trading.tinkoff_client import TinkoffClient
 from trading.order_executor import OrderExecutor
 from trading.settings_manager import get_settings
+from trading.db_logger import log_event  # ДОБАВЛЕНО
 from utils.telegram_notifications import send_telegram_message
 
 # Настройка временной зоны МСК
@@ -103,6 +104,14 @@ async def scheduled_liquidation():
             logger.info("Auto-liquidation is disabled, skipping")
             return
         
+        # ДОБАВЛЕНО: логирование события авто-ликвидации
+        await log_event(
+            event_type="auto_liquidation_start",
+            symbol=None,
+            details={"time": s.auto_liquidation_time},
+            message="Auto liquidation started"
+        )
+        
         client = TinkoffClient(tinkoff_token, account_id)
         executor = OrderExecutor(tinkoff_token, account_id)
         
@@ -141,16 +150,35 @@ async def scheduled_liquidation():
         
         # Отчет
         summary = (
-            f"✅ Авто-ликвидация завершена на {datetime.now(MSK).strftime('%H:%M:%S')} МСК\\n"
-            f"📊 Закрыто позиций: {closed_count}\\n"
-            f"🚫 Отменено лимитных: {limit_cancelled}\\n"
+            f"✅ Авто-ликвидация завершена на {datetime.now(MSK).strftime('%H:%M:%S')} МСК\n"
+            f"📊 Закрыто позиций: {closed_count}\n"
+            f"🚫 Отменено лимитных: {limit_cancelled}\n"
             f"🛑 Отменено стопов: {stop_cancelled}"
         )
         await send_notification(summary)
         
+        # ДОБАВЛЕНО: логирование завершения
+        await log_event(
+            event_type="auto_liquidation_complete",
+            symbol=None,
+            details={
+                "closed_positions": closed_count,
+                "cancelled_limits": limit_cancelled,
+                "cancelled_stops": stop_cancelled
+            },
+            message=f"Auto liquidation completed: {closed_count} positions closed"
+        )
+        
     except Exception as e:
         logger.error(f"Auto liquidation error: {e}", exc_info=True)
         await send_notification(f"❌ Ошибка авто-ликвидации: {e}")
+        # ДОБАВЛЕНО: логирование ошибки
+        await log_event(
+            event_type="error",
+            symbol=None,
+            details={"exception": str(e)},
+            message=f"Auto liquidation error: {str(e)}"
+        )
 
 async def _init_scheduler_async():
     """ИСПРАВЛЕНИЕ: Асинхронная инициализация планировщика"""
@@ -231,7 +259,7 @@ async def process_trade_webhook(action: str, symbol: str, risk_percent: float | 
             raise WebhookError(f"Неподдерживаемое действие: {action}")
 
         if result.get("success"):
-            await send_notification(f"✅ {action.upper()} {symbol} выполнен\\n📊 {result.get('details')}")
+            await send_notification(f"✅ {action.upper()} {symbol} выполнен\n📊 {result.get('details')}")
         else:
             await send_notification(f"❌ Ошибка {action.upper()} {symbol}: {result.get('error')}")
         return result
@@ -240,6 +268,15 @@ async def process_trade_webhook(action: str, symbol: str, risk_percent: float | 
         msg = f"❌ Критическая ошибка {action.upper()} {symbol}: {str(e)}"
         await send_notification(msg)
         logger.error(f"Trade processing error: {e}", exc_info=True)
+        
+        # ДОБАВЛЕНО: логирование критической ошибки
+        await log_event(
+            event_type="error",
+            symbol=symbol,
+            details={"action": action, "exception": str(e)},
+            message=f"Critical webhook processing error: {str(e)}"
+        )
+        
         return {"success": False, "error": str(e)}
 
 async def _amount_with_leverage(client: TinkoffClient, figi: str, risk_d: Decimal) -> tuple[Decimal, Decimal]:
@@ -399,15 +436,30 @@ async def handle_webhook(request: web_request.Request):
         if not action:
             return web.json_response({"status": "error", "message": "Missing action field"}, status=400)
 
+        # ДОБАВЛЕНО: логирование входящего webhook
+        symbol = data.get("symbol", "").upper() if data.get("symbol") else None
+        await log_event(
+            event_type="signal",
+            symbol=symbol,
+            details=data,
+            message=f"Webhook {action.upper()} {symbol or 'N/A'}"
+        )
+
         if action in ["buy", "sell"]:
             # НОВОЕ: проверка окна блокировки
             block, until_str = _is_block_window_now()
             if block:
                 msg = f"⏳ Режим авто-ликвидации: входящие сигналы игнорируются до {until_str} МСК"
                 await send_notification(msg)
+                # Логируем блокировку
+                await log_event(
+                    event_type="signal_blocked",
+                    symbol=symbol,
+                    details={"block_until": until_str},
+                    message=f"Signal blocked due to auto-liquidation window"
+                )
                 return web.json_response({"status": "success", "result": msg})
             
-            symbol = (data.get("symbol") or "").upper()
             if not symbol:
                 return web.json_response({"status": "error", "message": "Missing symbol field"}, status=400)
             
@@ -435,6 +487,16 @@ async def handle_webhook(request: web_request.Request):
 
     except Exception as e:
         logger.error(f"Webhook handler error: {e}", exc_info=True)
+        # ДОБАВЛЕНО: логирование критической ошибки в обработчике
+        try:
+            await log_event(
+                event_type="error",
+                symbol=None,
+                details={"exception": str(e)},
+                message=f"Critical webhook handler error: {str(e)}"
+            )
+        except Exception:
+            pass  # Не падаем если логирование не работает
         return web.json_response({"status": "error", "message": "Internal server error"}, status=500)
 
 async def handle_balance_request():
@@ -442,10 +504,28 @@ async def handle_balance_request():
         client = TinkoffClient(tinkoff_token, account_id)
         balance = await client.get_balance_async()
         await send_notification(f"💰 Баланс: {Decimal(str(balance)).quantize(Decimal('0.01'))} RUB")
+        
+        # ДОБАВЛЕНО: логирование запроса баланса
+        await log_event(
+            event_type="balance_request",
+            symbol=None,
+            details={"balance": str(balance)},
+            message=f"Balance request: {balance:.2f} RUB"
+        )
+        
         return balance
     except Exception as e:
         logger.error(f"Balance request error: {e}", exc_info=True)
         await send_notification(f"❌ Ошибка получения баланса: {str(e)}")
+        
+        # ДОБАВЛЕНО: логирование ошибки баланса
+        await log_event(
+            event_type="error",
+            symbol=None,
+            details={"exception": str(e)},
+            message=f"Balance request error: {str(e)}"
+        )
+        
         return 0
 
 async def handle_close_all_request():
@@ -477,17 +557,39 @@ async def handle_close_all_request():
 
         cancelled = await executor.cancel_all_orders()
 
-        message = (f"✅ Закрытие позиций завершено!\\n"
-                   f"📊 Закрыто позиций: {closed_count}\\n"
-                   f"🚫 Отменено лимитных ордеров: {cancelled['limit_orders']}\\n"
+        message = (f"✅ Закрытие позиций завершено!\n"
+                   f"📊 Закрыто позиций: {closed_count}\n"
+                   f"🚫 Отменено лимитных ордеров: {cancelled['limit_orders']}\n"
                    f"🛑 Отменено стоп-ордеров: {cancelled['stop_orders']}")
         await send_notification(message)
+        
+        # ДОБАВЛЕНО: логирование close_all
+        await log_event(
+            event_type="close_all",
+            symbol=None,
+            details={
+                "closed_positions": closed_count,
+                "cancelled_limits": cancelled["limit_orders"],
+                "cancelled_stops": cancelled["stop_orders"]
+            },
+            message=f"Close all completed: {closed_count} positions closed"
+        )
+        
         return {"success": True, "message": message}
 
     except Exception as e:
         error_msg = f"❌ Ошибка закрытия позиций: {str(e)}"
         await send_notification(error_msg)
         logger.error(f"Close all error: {e}", exc_info=True)
+        
+        # ДОБАВЛЕНО: логирование ошибки close_all
+        await log_event(
+            event_type="error",
+            symbol=None,
+            details={"exception": str(e)},
+            message=f"Close all error: {str(e)}"
+        )
+        
         return {"success": False, "error": str(e)}
 
 async def handle_health(request):
@@ -497,6 +599,14 @@ async def handle_health(request):
 async def init_app(app):
     """Вызывается после создания приложения, когда event loop уже работает"""
     await _init_scheduler_async()
+    
+    # ДОБАВЛЕНО: тестовое логирование при запуске
+    await log_event(
+        event_type="startup",
+        symbol=None,
+        details={"service": "webhook-server"},
+        message="Webhook server started"
+    )
 
 def create_app():
     app = web.Application()

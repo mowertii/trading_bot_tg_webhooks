@@ -1,80 +1,44 @@
 # app/trading/db_logger.py
-import os
+import asyncio
 import json
 import logging
-import asyncpg
-from typing import Optional
-from config import DATABASE_URL
+import os
 from datetime import datetime
+import asyncpg
 
 logger = logging.getLogger(__name__)
 
-# Ожидаем переменную окружения DB_URL вида: postgresql://user:pass@db:5432/trading_data
-DB_URL = os.getenv("DB_URL", "postgresql://bot:11111111@db:5432/trading_data")
+# Получаем URL базы данных из переменных окружения
+DATABASE_URL = os.getenv("DB_URL")
 
-_pool: Optional[asyncpg.pool.Pool] = None
-
-async def get_pool():
-    global _pool
-    if _pool is None:
-        if not DB_URL:
-            raise RuntimeError("DB_URL is not set in environment")
-        _pool = await asyncpg.create_pool(dsn=DB_URL, min_size=1, max_size=5)
-    return _pool
-
-async def log_signal(action: str, symbol: Optional[str], risk_percent: Optional[float], raw_payload: Optional[dict]):
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO signals (action, symbol, risk_percent, raw_payload)
-                VALUES ($1, $2, $3, $4)
-                """,
-                action, symbol, risk_percent, json.dumps(raw_payload) if raw_payload is not None else None
-            )
-    except Exception as e:
-        logger.exception("Failed to log signal: %s", e)
-
-async def log_trade(figi: str, ticker: Optional[str], direction: str, lots: int,
-                    amount: Optional[float], price: Optional[float], status: str, details: Optional[str] = None):
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO trades (figi, ticker, direction, lots, amount, price, status, details)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                """,
-                figi, ticker, direction, lots, amount, price, status, details
-            )
-    except Exception as e:
-        logger.exception("Failed to log trade: %s", e)
+async def log_event(event_type: str, symbol: str = None, details: dict = None, message: str = ""):
+    """Записывает событие в таблицу event_logs"""
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL not configured, skipping event logging")
+        return
         
-async def log_event(event_type: str, symbol: str | None, details: dict, message: str):
-    """
-    Записывает запись в таблицу event_logs.
-    """
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute(
-        """
-        INSERT INTO event_logs(event_time, event_type, symbol, details, message)
-        VALUES($1, $2, $3, $4::jsonb, $5)
-        """,
-        datetime.utcnow(), event_type, symbol, json.dumps(details), message
-    )
-    await conn.close()
-
-async def log_error(source: str, message: str, traceback_text: Optional[str] = None):
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO errors (source, message, traceback)
-                VALUES ($1, $2, $3)
-                """,
-                source, message, traceback_text
-            )
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        await conn.execute(
+            """
+            INSERT INTO event_logs(event_time, event_type, symbol, details, message)
+            VALUES($1, $2, $3, $4, $5)
+            """,
+            datetime.utcnow(), 
+            event_type, 
+            symbol, 
+            json.dumps(details or {}), 
+            message
+        )
+        
+        await conn.close()
+        logger.info(f"Logged event: {event_type} - {message}")
+        
     except Exception as e:
-        logger.exception("Failed to log error: %s", e)
+        logger.error(f"Failed to log event to database: {e}")
+
+# Функция для тестирования
+async def test_logging():
+    """Тестовая функция для проверки логирования"""
+    await log_event("test", "TEST_SYMBOL", {"test": True}, "Test log entry")
